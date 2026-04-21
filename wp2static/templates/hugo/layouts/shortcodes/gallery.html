@@ -1,0 +1,22 @@
+{{/*
+  Emitted by wp2static when it encounters a WordPress [gallery] or
+  [FinalTilesGallery] shortcode. Parameters:
+    images  comma-separated list of image URLs (required)
+    title   optional caption shown above the grid
+  Customise the markup / swap in a lightbox library as needed.
+*/}}
+{{- $images := split (.Get "images") "," -}}
+{{- $title  := .Get "title" -}}
+<figure class="wp2j-gallery">
+{{- with $title }}
+  <figcaption class="wp2j-gallery-title">{{ . }}</figcaption>
+{{- end }}
+  <div class="wp2j-gallery-grid">
+  {{- range $images }}
+    {{- $src := trim . " " }}
+    <a href="{{ $src | safeURL }}" class="wp2j-gallery-item">
+      <img src="{{ $src | safeURL }}" loading="lazy" alt="">
+    </a>
+  {{- end }}
+  </div>
+</figure>

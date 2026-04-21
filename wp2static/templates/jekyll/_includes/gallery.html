@@ -1,0 +1,21 @@
+{%- comment -%}
+  Emitted by wp2static when it encounters a WordPress [gallery] or
+  [FinalTilesGallery] shortcode. Parameters:
+    include.images  comma-separated list of image URLs (required)
+    include.title   optional caption shown above the grid
+  Customise the markup / swap in a lightbox library as needed.
+{%- endcomment -%}
+{%- assign images = include.images | split: "," -%}
+<figure class="wp2j-gallery">
+  {%- if include.title %}
+  <figcaption class="wp2j-gallery-title">{{ include.title }}</figcaption>
+  {%- endif %}
+  <div class="wp2j-gallery-grid">
+  {%- for img in images -%}
+    {%- assign src = img | strip -%}
+    <a href="{{ src }}" class="wp2j-gallery-item">
+      <img src="{{ src }}" loading="lazy" alt="">
+    </a>
+  {%- endfor %}
+  </div>
+</figure>

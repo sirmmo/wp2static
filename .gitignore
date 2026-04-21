@@ -1,0 +1,37 @@
+# Python bytecode / build artefacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+*.whl
+
+# Virtual envs (shouldn't exist — we build via Docker — but guard anyway)
+.venv/
+venv/
+env/
+
+# Test & coverage caches
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Generated site output from wp2static runs (never commit)
+/test/
+/_site/
+/site/
+/public/
+/out/
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Claude Code local state
+.claude/

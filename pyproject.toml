@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wp2static"
+version = "0.1.0"
+description = "Migrate a WordPress MySQL dump to a Jekyll or Hugo static site"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Marco Montanari" }]
+dependencies = [
+    "PyYAML>=6.0",
+    "markdownify>=0.11",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.urls]
+Homepage = "https://github.com/sirmmo/wp2static"
+Source = "https://github.com/sirmmo/wp2static"
+Issues = "https://github.com/sirmmo/wp2static/issues"
+
+[project.scripts]
+wp2static = "wp2static.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+include = ["wp2static*"]
+
+[tool.setuptools.package-data]
+wp2static = ["templates/**/*.html"]
