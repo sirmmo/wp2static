@@ -138,4 +138,4 @@ are changing, and keep the Docker-first workflow intact.
 
 ## Licence
 
-MIT — see the `license` field in `pyproject.toml`.
+MIT — see [LICENSE](LICENSE).
