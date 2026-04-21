@@ -308,7 +308,104 @@ def transpile_template(php: str, target: str) -> tuple[str, list[str]]:
         block = php[m.end():end.start()]
         out.append(_transpile_php(block, target, unmapped))
         i = end.end()
-    return "".join(out), unmapped
+    body = "".join(out)
+    body = _balance_control_flow(body, target)
+    return body, unmapped
+
+
+# --- control-flow balancing -------------------------------------------------
+#
+# Rule-based PHP translation can leave orphan control tags in the output: e.g.
+# a ``<?php if (have_posts()): while... endwhile; else: ?>`` block that also
+# contains untranslatable PHP collapses into one unmapped comment, but the
+# paired ``<?php endif; ?>`` later on is standalone and *does* translate — so
+# the resulting template has an ``{% endif %}`` with no opener. Liquid and
+# Go's html/template both refuse to parse that. We scan the rendered output,
+# pair opens with closes, and convert anything unpaired into a comment.
+
+_JEKYLL_TAG_RE = re.compile(r"\{%-?\s*(\w+)\b[^%]*-?%\}")
+_JEKYLL_OPENS = {"if", "for", "unless", "case", "capture", "tablerow",
+                 "comment", "raw"}
+_JEKYLL_CLOSE_FOR = {
+    "endif": "if", "endfor": "for", "endunless": "unless",
+    "endcase": "case", "endcapture": "capture", "endtablerow": "tablerow",
+    "endcomment": "comment", "endraw": "raw",
+}
+_JEKYLL_CONTINUATIONS = {"else", "elsif", "when"}
+
+_HUGO_TAG_RE = re.compile(r"\{\{-?\s*(\w+)\b[^}]*-?\}\}")
+_HUGO_OPENS = {"if", "with", "range", "block", "define"}
+
+
+def _balance_control_flow(text: str, target: str) -> str:
+    if target == "hugo":
+        return _balance_hugo(text)
+    return _balance_jekyll(text)
+
+
+def _drop_tag(match: re.Match) -> str:
+    orig = match.group(0).replace("-->", "--&gt;")
+    return f"<!-- wp2static: dropped orphan {orig} -->"
+
+
+def _balance_jekyll(text: str) -> str:
+    matches = list(_JEKYLL_TAG_RE.finditer(text))
+    if not matches:
+        return text
+    stack: list[int] = []   # indices into ``matches`` for still-open tags
+    drop: set[int] = set()
+    for i, m in enumerate(matches):
+        tag = m.group(1)
+        if tag in _JEKYLL_OPENS:
+            stack.append(i)
+        elif tag in _JEKYLL_CLOSE_FOR:
+            want = _JEKYLL_CLOSE_FOR[tag]
+            if stack and matches[stack[-1]].group(1) == want:
+                stack.pop()
+            else:
+                drop.add(i)
+        elif tag in _JEKYLL_CONTINUATIONS and not stack:
+            drop.add(i)
+    drop.update(stack)   # any unclosed openers
+    if not drop:
+        return text
+    return _rewrite_matches(text, matches, drop)
+
+
+def _balance_hugo(text: str) -> str:
+    matches = list(_HUGO_TAG_RE.finditer(text))
+    if not matches:
+        return text
+    stack: list[int] = []
+    drop: set[int] = set()
+    for i, m in enumerate(matches):
+        tag = m.group(1)
+        if tag in _HUGO_OPENS:
+            stack.append(i)
+        elif tag == "end":
+            if stack:
+                stack.pop()
+            else:
+                drop.add(i)
+        elif tag == "else" and not stack:
+            drop.add(i)
+    drop.update(stack)
+    if not drop:
+        return text
+    return _rewrite_matches(text, matches, drop)
+
+
+def _rewrite_matches(
+    text: str, matches: list[re.Match], drop: set[int],
+) -> str:
+    out: list[str] = []
+    last = 0
+    for i, m in enumerate(matches):
+        out.append(text[last:m.start()])
+        out.append(_drop_tag(m) if i in drop else m.group(0))
+        last = m.end()
+    out.append(text[last:])
+    return "".join(out)
 
 
 # --- asset + output layout --------------------------------------------------

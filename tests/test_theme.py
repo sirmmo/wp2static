@@ -100,3 +100,46 @@ def test_transpile_marks_unmapped_calls():
     out, unmapped = transpile_template(php, "jekyll")
     assert "wp2static: unmapped PHP" in out
     assert any("bard_options" in call for call in unmapped)
+
+
+def _strip_comments(html: str) -> str:
+    import re as _re
+    return _re.sub(r"<!--.*?-->", "", html, flags=_re.DOTALL)
+
+
+def test_transpile_drops_orphan_jekyll_endif():
+    # The canonical bad-shape: a PHP block with unmappable logic around the
+    # loop swallows the `if (have_posts()):` opener as an unmapped comment,
+    # but the later standalone `<?php endif; ?>` does translate — leaving a
+    # dangling `{% endif %}` that Liquid rejects. The balancer must rewrite
+    # the orphan into a comment, not a live tag.
+    php = (
+        "<?php if (have_posts()) : while (have_posts()) : the_post();\n"
+        "  bard_options('x'); endwhile; else: ?>\n"
+        "<p>no posts</p>\n"
+        "<?php endif; ?>"
+    )
+    out, _ = transpile_template(php, "jekyll")
+    assert "wp2static: dropped orphan {% endif %}" in out
+    # No live {% endif %} survives outside the comment.
+    assert "{% endif %}" not in _strip_comments(out)
+
+
+def test_transpile_drops_orphan_hugo_end():
+    php = "<?php endif; ?>"   # rule table emits {{ end }} with no opener
+    out, _ = transpile_template(php, "hugo")
+    assert "wp2static: dropped orphan {{ end }}" in out
+    assert "{{ end }}" not in _strip_comments(out)
+
+
+def test_transpile_preserves_balanced_control_flow():
+    php = (
+        "<?php if (have_posts()) : while (have_posts()) : the_post(); ?>\n"
+        "<h2><?php the_title(); ?></h2>\n"
+        "<?php endwhile; endif; ?>"
+    )
+    out, _ = transpile_template(php, "jekyll")
+    # Balanced open + close are preserved; nothing is dropped.
+    assert "wp2static: dropped orphan" not in out
+    assert "{% for page in paginator.posts %}" in out
+    assert "{% endfor %}" in out
