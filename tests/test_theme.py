@@ -99,10 +99,12 @@ def test_transpile_rewrites_core_tags_for_hugo():
     assert "{{ .Content }}" in out
 
 
-def test_hugo_replacements_emit_no_stray_backslashes():
+def test_hugo_replacements_use_safe_string_quoting():
     # Go's html/template parser rejects `\"` inside `{{ … }}` ("unexpected
-    # `\\` in command"), and stray backslashes elsewhere leak into HTML
-    # attributes. Check the core rewrites all emit clean double quotes.
+    # `\\` in command") and also gets confused when a Go-template string
+    # literal inside a `{{ … }}` action uses the same quote character as
+    # the surrounding HTML attribute value. Use backticks for Go-template
+    # string literals so the rule output survives every HTML context.
     php = (
         "<html <?php language_attributes(); ?>>\n"
         "<body <?php body_class(); ?>>\n"
@@ -115,8 +117,10 @@ def test_hugo_replacements_emit_no_stray_backslashes():
     assert "\\\"" not in out
     # Spot-check that the usual patterns are there in their clean shape.
     assert 'lang="{{ .Site.Language.Lang }}"' in out
-    assert '{{ "/" | absURL }}' in out
-    assert '{{ partial "searchform.html" . }}' in out
+    assert "{{ `/` | absURL }}" in out
+    assert "{{ partial `searchform.html` . }}" in out
+    # The body_class rule must not nest `"page"` inside `class="…"`.
+    assert 'class="{{ .Params.body_class | default `page` }}"' in out
 
 
 def test_transpile_expands_get_header_and_template_parts():
@@ -125,8 +129,8 @@ def test_transpile_expands_get_header_and_template_parts():
     assert "{% include header.html %}" in jekyll
     assert "{% include content-single.html %}" in jekyll
     hugo, _ = transpile_template(php, "hugo")
-    assert '{{ partial "header.html" . }}' in hugo
-    assert '{{ partial "content-single.html" . }}' in hugo
+    assert "{{ partial `header.html` . }}" in hugo
+    assert "{{ partial `content-single.html` . }}" in hugo
 
 
 def test_transpile_marks_unmapped_calls():
@@ -150,46 +154,84 @@ def test_transpile_drops_orphan_jekyll_endif():
         "<?php endif; ?>"
     )
     out, _ = transpile_template(php, "jekyll")
-    assert "wp2static dropped orphan endif" in out
+    assert "wp2static dropped orphan: endif" in out
     # No live `{% endif %}` survives anywhere in the output.
     assert "{% endif %}" not in out
-    # And nothing HTML-comment-shaped either, so the marker is safe if it
-    # ends up inside an attribute value.
-    assert "<!--" not in out or "wp2static" not in out.split("<!--", 1)[1]
+    # The drop marker uses Liquid's own comment tag so it's safe inside
+    # HTML attribute values and renders to empty at build time.
+    assert "{% comment %}" in out
+    assert "{% endcomment %}" in out
 
 
 def test_transpile_drops_orphan_hugo_end():
     php = "<?php endif; ?>"   # rule table emits {{ end }} with no opener
     out, _ = transpile_template(php, "hugo")
-    assert "wp2static dropped orphan end" in out
+    assert "wp2static dropped orphan: end" in out
     assert "{{ end }}" not in out
+    # Uses Go's template-comment syntax, which Hugo renders to empty.
+    assert out.strip().startswith("{{/*")
+    assert out.strip().endswith("*/}}")
 
 
-def test_unmapped_php_marker_strips_template_and_html_syntax():
-    # Some theme PHP emits strings that contain `{%` / `{{` or HTML
-    # delimiters. Whatever we record for later debugging must not contain
-    # characters that either the SSG template parser or an HTML attribute
-    # tokeniser would react to.
-    php = "<?php echo '{% boom %} {{ kaboom }} <x y=\"z\">'; bard_options('x'); ?>"
+def test_unmapped_php_marker_cannot_break_out_of_its_own_comment():
+    # Liquid's `{% comment %}` wrapper renders to empty and so swallows
+    # any HTML / template syntax inside — *unless* the body itself
+    # contains a `{% endcomment %}` or a stray `%}` that ends the comment
+    # tag early. Defang the characters that could close the comment so a
+    # hostile PHP source string can't escape it.
+    php = "<?php echo '{% boom %} {{ kaboom }} %} endcomment'; bard_options('x'); ?>"
     out, _ = transpile_template(php, "jekyll")
     assert "wp2static unmapped" in out
-    for forbidden in ("{% boom %}", "{{ kaboom }}", "<x", 'y="z"'):
-        assert forbidden not in out
+    # No `%}` or `{%` anywhere except in the comment delimiters we emit.
+    cleaned = out.replace("{% comment %}", "").replace("{% endcomment %}", "")
+    assert "%}" not in cleaned
+    assert "{%" not in cleaned
+
+
+def test_unmapped_php_marker_cannot_break_out_of_its_own_comment_hugo():
+    # Same story for Hugo: `*/` inside the Go-template comment would
+    # terminate it. Make sure nothing resembling `*/` escapes.
+    php = "<?php /* */ echo 'oops */'; bard_options('x'); ?>"
+    out, _ = transpile_template(php, "hugo")
+    assert "wp2static unmapped" in out
+    cleaned = out.replace("{{/*", "").replace("*/}}", "")
+    assert "*/" not in cleaned
 
 
 def test_unmapped_php_marker_is_attribute_safe_on_hugo():
     # The Hugo html/template parser refuses `<` or `"` inside attribute
     # values, so any unmapped-PHP marker that ends up in an attribute
-    # value must not contain either.
+    # value must render to something parser-safe. A Go-template comment
+    # (`{{/* … */}}`) is expanded to the empty string before html/template
+    # tokenises the HTML, so it's safe anywhere in the output.
     php = '<div class="<?php weird_fn(); ?>">hi</div>'
     out, _ = transpile_template(php, "hugo")
-    # Pull out the `class="..."` value.
     import re as _re
     m = _re.search(r'class="([^"]*)"', out)
     assert m is not None
     value = m.group(1)
     assert "<" not in value
     assert '"' not in value
+    assert "wp2static unmapped" in value
+    # The marker must use Go's template-comment syntax so Hugo renders it
+    # to an empty string at build time.
+    assert value.startswith("{{/*")
+    assert value.endswith("*/}}")
+
+
+def test_unmapped_php_marker_is_attribute_safe_on_jekyll():
+    # Liquid's comment tag renders to the empty string, so a `{% comment %}`
+    # marker is safe in any HTML context — including inside an attribute
+    # value where a raw `<!-- -->` wrapper would otherwise leave literal
+    # comment characters in the rendered HTML.
+    php = '<div class="<?php weird_fn(); ?>">hi</div>'
+    out, _ = transpile_template(php, "jekyll")
+    import re as _re
+    m = _re.search(r'class="([^"]*)"', out)
+    assert m is not None
+    value = m.group(1)
+    assert value.startswith("{% comment %}")
+    assert value.endswith("{% endcomment %}")
     assert "wp2static unmapped" in value
 
 
@@ -210,7 +252,12 @@ def test_stub_missing_includes_jekyll(tmp_path: Path):
     assert count == 1
     stub = tmp_path / "_includes" / "searchform.html"
     assert stub.is_file()
-    assert "stub for missing include" in stub.read_text(encoding="utf-8")
+    body = stub.read_text(encoding="utf-8")
+    assert "stub for missing include" in body
+    # The stub must render to empty — it might be included inside an
+    # attribute value, so a raw `<!-- -->` marker would leak into output.
+    assert body.startswith("{% comment %}")
+    assert "{% endcomment %}" in body
     # The real one is not overwritten.
     real = (tmp_path / "_includes" / "templates" / "sidebars" / "sidebar-left.html")
     assert real.read_text(encoding="utf-8") == "real sidebar"
@@ -226,7 +273,11 @@ def test_stub_missing_includes_hugo(tmp_path: Path):
     )
     count = _stub_missing_includes(tmp_path, "demo", "hugo")
     assert count == 1
-    assert (layouts / "partials" / "header.html").is_file()
+    stub = layouts / "partials" / "header.html"
+    assert stub.is_file()
+    body = stub.read_text(encoding="utf-8")
+    assert body.startswith("{{/*")
+    assert "*/}}" in body
 
 
 def test_transpile_preserves_balanced_control_flow():

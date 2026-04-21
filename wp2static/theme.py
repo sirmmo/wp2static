@@ -125,17 +125,20 @@ _RULES: list[_Rule] = [
           r"{{ site.lang | default: 'en' }}", r"{{ .Site.Language.Lang }}"),
 
     # language_attributes, body_class, post_class, site_url, home_url
+    # Go template string literals use backticks here (not `"…"`) so they
+    # never nest inside an HTML `"…"` attribute value — html/template's
+    # context scanner otherwise treats the inner `"` as closing the attr.
     _rule(r"""language_attributes\s*\(\s*\)""",
           '''lang="{{ site.lang | default: 'en' }}"''',
           '''lang="{{ .Site.Language.Lang }}"'''),
     _rule(r"""body_class\s*\(\s*\)""",
           '''class="{{ page.body_class | default: 'page' }}"''',
-          '''class="{{ .Params.body_class | default "page" }}"'''),
+          'class="{{ .Params.body_class | default `page` }}"'),
     _rule(r"""post_class\s*\(\s*\)""",
           '''class="{{ include.post_class | default: 'post' }}"''',
-          '''class="{{ .Params.post_class | default "post" }}"'''),
+          'class="{{ .Params.post_class | default `post` }}"'),
     _rule(r"""home_url\s*\(\s*['"]/?['"]\s*\)""",
-          r"{{ '/' | absolute_url }}", '''{{ "/" | absURL }}'''),
+          r"{{ '/' | absolute_url }}", "{{ `/` | absURL }}"),
     _rule(r"""site_url\s*\(\s*\)""",
           r"{{ site.url }}", r"{{ .Site.BaseURL }}"),
 
@@ -202,7 +205,7 @@ _RULES: list[_Rule] = [
     # get_search_form is close enough to a search include
     _rule(r"""get_search_form\s*\(\s*\)""",
           r"{% include searchform.html %}",
-          '''{{ partial "searchform.html" . }}'''),
+          "{{ partial `searchform.html` . }}"),
 ]
 
 
@@ -217,7 +220,9 @@ _GET_TEMPLATE_PART_RE = re.compile(
 def _include(target: str, slug: str) -> str:
     slug = slug.replace("\\", "/").strip("/")
     if target == "hugo":
-        return f'{{{{ partial "{slug}.html" . }}}}'
+        # Backtick-quoted string literal so the partial call is safe even
+        # if it lands inside an HTML `"…"` attribute value.
+        return "{{ partial `" + slug + ".html` . }}"
     return f'{{% include {slug}.html %}}'
 
 
@@ -271,16 +276,24 @@ def _transpile_php(php: str, target: str, unmapped: list[str]) -> str:
     if _looks_like_template_only(residue):
         return residue
     unmapped.append(original.split("\n", 1)[0].strip()[:200])
-    # Emit a marker that's safe inside both HTML body text *and* HTML
-    # attribute values. An HTML-comment wrapper isn't safe in attributes —
-    # Hugo's html/template rejects `<` appearing inside an attribute name,
-    # and Liquid would still parse any `{% %}` inside it — so scrub the
-    # characters that either parser might react to.
-    snippet = (original.split("\n", 1)[0][:200]
-               .replace("<", " ").replace(">", " ")
-               .replace('"', " ").replace("'", " ")
-               .replace("{", " ").replace("}", " "))
-    return f"/*wp2static unmapped: {' '.join(snippet.split())}*/"
+    return _marker(original.split("\n", 1)[0][:200], target, "unmapped")
+
+
+def _marker(raw: str, target: str, kind: str) -> str:
+    """Render a marker in the SSG's own comment syntax.
+
+    Both Liquid's ``{% comment %} … {% endcomment %}`` and Go's
+    ``{{/* … */}}`` render to the empty string, so the marker is safe
+    anywhere in the output — body text, HTML attribute values, between
+    a tag name and its attributes — without confusing the HTML-aware
+    parsers the way raw ``<!-- -->`` or ``/* */`` wrappers would.
+    """
+    body = (raw.replace("{", " ").replace("}", " ")
+               .replace("*/", " ").replace("%}", " "))
+    body = " ".join(body.split())
+    if target == "hugo":
+        return "{{/* wp2static " + kind + ": " + body + " */}}"
+    return "{% comment %}wp2static " + kind + ": " + body + "{% endcomment %}"
 
 
 _TEMPLATE_TOKEN_RE = re.compile(r"(\{\{.*?\}\}|\{%.*?%\}|<!--.*?-->)", re.DOTALL)
@@ -372,18 +385,6 @@ def _balance_control_flow(text: str, target: str) -> str:
     return _balance_jekyll(text)
 
 
-def _drop_tag(match: re.Match) -> str:
-    # Use a plain `/*…*/` marker rather than an HTML comment: the orphan
-    # tag can land anywhere (attribute value, body text, inside a Go
-    # template expression that somehow survived), and an HTML-comment
-    # wrapper isn't universally safe — Hugo's html/template refuses `<`
-    # in attribute names, and Liquid still parses `{% %}` inside HTML
-    # comments. Record only the tag verb ("endif", "end", …) so neither
-    # parser sees a live template token.
-    tag = match.group(1)
-    return f"/*wp2static dropped orphan {tag}*/"
-
-
 def _balance_jekyll(text: str) -> str:
     matches = list(_JEKYLL_TAG_RE.finditer(text))
     if not matches:
@@ -405,7 +406,7 @@ def _balance_jekyll(text: str) -> str:
     drop.update(stack)   # any unclosed openers
     if not drop:
         return text
-    return _rewrite_matches(text, matches, drop)
+    return _rewrite_matches(text, matches, drop, "jekyll")
 
 
 def _balance_hugo(text: str) -> str:
@@ -428,17 +429,20 @@ def _balance_hugo(text: str) -> str:
     drop.update(stack)
     if not drop:
         return text
-    return _rewrite_matches(text, matches, drop)
+    return _rewrite_matches(text, matches, drop, "hugo")
 
 
 def _rewrite_matches(
-    text: str, matches: list[re.Match], drop: set[int],
+    text: str, matches: list[re.Match], drop: set[int], target: str,
 ) -> str:
     out: list[str] = []
     last = 0
     for i, m in enumerate(matches):
         out.append(text[last:m.start()])
-        out.append(_drop_tag(m) if i in drop else m.group(0))
+        out.append(
+            _marker(m.group(1), target, "dropped orphan")
+            if i in drop else m.group(0)
+        )
         last = m.end()
     out.append(text[last:])
     return "".join(out)
@@ -573,10 +577,14 @@ def _stub_missing_includes(out_dir: Path, slug: str, target: str) -> int:
         if dst.exists():
             continue
         dst.parent.mkdir(parents=True, exist_ok=True)
-        dst.write_text(
-            f"<!-- wp2static: stub for missing include '{ref}' -->\n",
-            encoding="utf-8",
-        )
+        # SSG comment renders to the empty string, so the stub is safe
+        # even if it's included inside an HTML attribute value.
+        if target == "hugo":
+            body = f"{{{{/* wp2static stub for missing include {ref} */}}}}\n"
+        else:
+            body = (f"{{% comment %}}wp2static stub for missing include {ref}"
+                    "{% endcomment %}\n")
+        dst.write_text(body, encoding="utf-8")
         stubs += 1
     return stubs
 
