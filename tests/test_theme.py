@@ -49,6 +49,16 @@ def test_jekyll_layout_for_maps_top_level_templates():
     assert _jekyll_layout_for(Path("templates/content.php")) == Path(
         "_includes/templates/content.html"
     )
+    # nested sidebar/header/footer files keep their full path so the
+    # corresponding {% include templates/sidebars/sidebar-left.html %}
+    # emitted from get_template_part('templates/sidebars/sidebar','left')
+    # resolves to an existing file.
+    assert _jekyll_layout_for(Path("templates/sidebars/sidebar-left.php")) == Path(
+        "_includes/templates/sidebars/sidebar-left.html"
+    )
+    assert _jekyll_layout_for(Path("templates/header/featured-slider.php")) == Path(
+        "_includes/templates/header/featured-slider.html"
+    )
 
 
 def test_hugo_layout_for_puts_things_under_theme_root():
@@ -57,6 +67,9 @@ def test_hugo_layout_for_puts_things_under_theme_root():
     )
     assert _hugo_layout_for("kale", Path("header.php")) == Path(
         "themes/kale/layouts/partials/header.html"
+    )
+    assert _hugo_layout_for("kale", Path("templates/sidebars/sidebar-left.php")) == Path(
+        "themes/kale/layouts/partials/templates/sidebars/sidebar-left.html"
     )
     assert _hugo_layout_for("kale", Path("functions.php")) is None
 

@@ -458,9 +458,15 @@ def _jekyll_layout_for(php_path: Path) -> Path | None:
     }
     if len(php_path.parts) == 1 and name in top_level_layouts:
         return Path(top_level_layouts[name])
-    # header.php / footer.php / sidebar*.php → includes
+    # Top-level header.php / footer.php / sidebar*.php → bare includes so
+    # `get_header()` / `get_sidebar('left')` can find them.  Nested files
+    # (e.g. `templates/sidebars/sidebar-left.php`) keep their full path so
+    # the `get_template_part(...)` call that references them resolves to
+    # the same layout the WP theme expects.
     stem = php_path.stem
-    if stem in ("header", "footer") or stem.startswith("sidebar"):
+    if len(php_path.parts) == 1 and (
+        stem in ("header", "footer") or stem.startswith("sidebar")
+    ):
         return Path("_includes") / f"{stem}.html"
     # everything else (incl. templates/**) → _includes preserving structure
     return Path("_includes") / php_path.with_suffix(".html")
