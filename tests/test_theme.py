@@ -264,20 +264,26 @@ def test_stub_missing_includes_jekyll(tmp_path: Path):
 
 
 def test_stub_missing_includes_hugo(tmp_path: Path):
+    # Mix both quoting styles: the theme transpiler emits backtick-quoted
+    # partial paths (so string literals don't collide with HTML `"…"`
+    # attribute quotes), but hand-written partials sometimes use double
+    # quotes. The stubber must see both forms.
     layouts = tmp_path / "themes" / "demo" / "layouts"
     layouts.mkdir(parents=True)
     (layouts / "_default").mkdir()
     (layouts / "_default" / "single.html").write_text(
-        '{{ partial "header.html" . }}\n',
+        '{{ partial "header.html" . }}\n'
+        "{{ partial `searchform.html` . }}\n",
         encoding="utf-8",
     )
     count = _stub_missing_includes(tmp_path, "demo", "hugo")
-    assert count == 1
-    stub = layouts / "partials" / "header.html"
-    assert stub.is_file()
-    body = stub.read_text(encoding="utf-8")
-    assert body.startswith("{{/*")
-    assert "*/}}" in body
+    assert count == 2
+    for name in ("header.html", "searchform.html"):
+        stub = layouts / "partials" / name
+        assert stub.is_file(), name
+        body = stub.read_text(encoding="utf-8")
+        assert body.startswith("{{/*")
+        assert "*/}}" in body
 
 
 def test_transpile_preserves_balanced_control_flow():

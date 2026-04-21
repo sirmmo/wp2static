@@ -540,7 +540,11 @@ def _hugo_layout_for(slug: str, php_path: Path) -> Path | None:
 # `{% include foo.html %}` / `{% include foo/bar.html %}`. The path segment
 # ends at the first whitespace or `%`. Liquid tolerates a trailing dash.
 _JEKYLL_INCLUDE_RE = re.compile(r"\{%-?\s*include\s+([^\s%}]+)")
-_HUGO_PARTIAL_RE = re.compile(r'\{\{-?\s*partial\s+"([^"]+)"')
+# Hugo partial calls use either double-quoted or backtick-quoted string
+# literals for the partial path — `{{ partial "foo.html" . }}` or
+# `{{ partial `foo.html` . }}`. Match both so the stubber sees every
+# referenced partial regardless of quoting style.
+_HUGO_PARTIAL_RE = re.compile(r'\{\{-?\s*partial\s+(?:"([^"]+)"|`([^`]+)`)')
 
 
 def _stub_missing_includes(out_dir: Path, slug: str, target: str) -> int:
@@ -570,7 +574,10 @@ def _stub_missing_includes(out_dir: Path, slug: str, target: str) -> int:
             continue
         text = p.read_text(encoding="utf-8", errors="replace")
         for m in pattern.finditer(text):
-            refs.add(m.group(1).strip().strip('"\''))
+            # Jekyll pattern has one group; Hugo pattern has two
+            # alternatives — pick whichever captured.
+            ref = next(g for g in m.groups() if g is not None)
+            refs.add(ref.strip().strip('"\'`'))
     stubs = 0
     for ref in refs:
         dst = include_root / ref
