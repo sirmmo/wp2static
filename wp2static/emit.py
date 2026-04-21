@@ -108,6 +108,53 @@ def _uploads_dest(opts: EmitOptions) -> Path:
     return opts.out_dir / "assets" / "uploads"
 
 
+def _front_page(site: Site) -> Post | None:
+    """Return the page configured as the static front page, if any."""
+    if site.show_on_front != "page" or not site.page_on_front:
+        return None
+    for page in site.pages:
+        if page.post_id == site.page_on_front:
+            return page
+    return None
+
+
+def _write_index(
+    opts: EmitOptions, site: Site, front_page: Post | None, front_body: str,
+) -> int:
+    """Write the site's homepage file. Returns 1 if written, else 0."""
+    title = front_page.title if front_page else (site.site_name or "Home")
+    if opts.target == "hugo":
+        fm: dict = {"title": title}
+        if front_page and front_page.date:
+            fm["date"] = front_page.date.isoformat(sep=" ")
+        if site.site_description and not front_page:
+            fm["description"] = site.site_description
+        body = front_body if front_page else ""
+        # Match the file extension to the body format so Hugo's markdown
+        # renderer doesn't accidentally process HTML content.
+        index_ext = ".md" if opts.markdown else ".html"
+        _write_file(
+            opts.out_dir / "content" / f"_index{index_ext}",
+            _frontmatter(fm, "hugo") + body + "\n",
+        )
+        # Section index for posts — lets Hugo render /posts/ via list.html.
+        _write_file(
+            opts.out_dir / "content" / "posts" / f"_index{index_ext}",
+            _frontmatter({"title": "Posts"}, "hugo") + "\n",
+        )
+        return 1
+    # jekyll
+    fm = {"layout": "home", "title": title}
+    if site.site_description and not front_page:
+        fm["description"] = site.site_description
+    body = front_body if front_page else ""
+    _write_file(
+        opts.out_dir / "index.html",
+        _frontmatter(fm, "jekyll") + body + "\n",
+    )
+    return 1
+
+
 def emit(site: Site, opts: EmitOptions) -> dict:
     """Write the full site tree. Returns a small stats dict."""
     ext = _file_ext(opts.markdown)
@@ -117,6 +164,8 @@ def emit(site: Site, opts: EmitOptions) -> dict:
     written_posts = 0
     written_pages = 0
     elementor_posts = 0
+    front_page = _front_page(site)
+    front_body = ""
 
     for post in site.posts + site.pages:
         source_html = post.content_html
@@ -145,12 +194,17 @@ def emit(site: Site, opts: EmitOptions) -> dict:
         referenced_uploads.update(extract_upload_paths(source_html, base_url))
         if post.featured_image and post.featured_image.file:
             referenced_uploads.add(post.featured_image.file)
+        if front_page is not None and post.post_id == front_page.post_id:
+            front_body = body
+            continue  # don't also write this page under content/<slug>.html
         path = _post_output_path(opts, post, ext)
         _write_file(path, _frontmatter(fm, opts.target) + body + "\n")
         if post.post_type == "post":
             written_posts += 1
         else:
             written_pages += 1
+
+    indexes_written = _write_index(opts, site, front_page, front_body)
 
     templates_copied = 0
     if opts.install_templates:
@@ -187,4 +241,5 @@ def emit(site: Site, opts: EmitOptions) -> dict:
         "uploads_referenced": len(referenced_uploads),
         "uploads_copied": copied,
         "templates_copied": templates_copied,
+        "indexes_written": indexes_written,
     }

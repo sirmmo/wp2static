@@ -106,6 +106,9 @@ class Site:
     active_theme: str = ""   # from wp_options.stylesheet (falls back to template)
     site_name: str = ""      # from wp_options.blogname
     site_description: str = ""   # from wp_options.blogdescription
+    show_on_front: str = ""  # 'posts' | 'page' — from wp_options.show_on_front
+    page_on_front: int = 0   # post ID used as the static front page
+    page_for_posts: int = 0  # post ID used as the blog index
 
 
 def wp_unslash(value: str) -> str:
@@ -163,6 +166,9 @@ def load(dump_path: Path, table_prefix: str = "wp_") -> Site:
     active_theme = ""
     site_name = ""
     site_description = ""
+    show_on_front = ""
+    page_on_front = 0
+    page_for_posts = 0
     ft_galleries: dict[int, dict] = {}       # Id -> {"slug", "name"}
     ft_images: dict[int, list[dict]] = {}    # gid -> [{"sort", "imageId", "url"}]
 
@@ -200,6 +206,18 @@ def load(dump_path: Path, table_prefix: str = "wp_") -> Site:
                 site_name = str(value)
             elif name == "blogdescription":
                 site_description = str(value)
+            elif name == "show_on_front":
+                show_on_front = str(value)
+            elif name == "page_on_front":
+                try:
+                    page_on_front = int(value)
+                except (TypeError, ValueError):
+                    page_on_front = 0
+            elif name == "page_for_posts":
+                try:
+                    page_for_posts = int(value)
+                except (TypeError, ValueError):
+                    page_for_posts = 0
         elif suffix == "FinalTiles_gallery":
             d = _row_to_dict(row, FT_GALLERY_COLS)
             try:
@@ -307,4 +325,7 @@ def load(dump_path: Path, table_prefix: str = "wp_") -> Site:
         active_theme=active_theme,
         site_name=site_name,
         site_description=site_description,
+        show_on_front=show_on_front,
+        page_on_front=page_on_front,
+        page_for_posts=page_for_posts,
     )
