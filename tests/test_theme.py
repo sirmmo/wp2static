@@ -125,7 +125,9 @@ def test_transpile_drops_orphan_jekyll_endif():
     # loop swallows the `if (have_posts()):` opener as an unmapped comment,
     # but the later standalone `<?php endif; ?>` does translate — leaving a
     # dangling `{% endif %}` that Liquid rejects. The balancer must rewrite
-    # the orphan into a comment, not a live tag.
+    # the orphan into a defanged comment, not a live tag. Liquid parses
+    # `{% ... %}` even inside HTML comments, so the braces themselves must
+    # be broken up in the dropped-tag text.
     php = (
         "<?php if (have_posts()) : while (have_posts()) : the_post();\n"
         "  bard_options('x'); endwhile; else: ?>\n"
@@ -133,16 +135,30 @@ def test_transpile_drops_orphan_jekyll_endif():
         "<?php endif; ?>"
     )
     out, _ = transpile_template(php, "jekyll")
-    assert "wp2static: dropped orphan {% endif %}" in out
-    # No live {% endif %} survives outside the comment.
-    assert "{% endif %}" not in _strip_comments(out)
+    assert "wp2static: dropped orphan { % endif % }" in out
+    # No live `{% endif %}` appears anywhere — not even inside a comment,
+    # because Liquid would still parse it there.
+    assert "{% endif %}" not in out
 
 
 def test_transpile_drops_orphan_hugo_end():
     php = "<?php endif; ?>"   # rule table emits {{ end }} with no opener
     out, _ = transpile_template(php, "hugo")
-    assert "wp2static: dropped orphan {{ end }}" in out
-    assert "{{ end }}" not in _strip_comments(out)
+    assert "wp2static: dropped orphan { { end } }" in out
+    # Hugo also parses `{{ ... }}` inside HTML comments, so the raw tag
+    # must not appear anywhere in the output.
+    assert "{{ end }}" not in out
+
+
+def test_unmapped_php_comment_defangs_template_braces():
+    # Some theme PHP emits strings that contain `{%` / `{{` — if they land
+    # inside the unmapped-PHP comment verbatim, Liquid/Hugo will try to
+    # parse them. The comment writer must defang those braces too.
+    php = "<?php echo '{% boom %} {{ kaboom }}'; bard_options('x'); ?>"
+    out, _ = transpile_template(php, "jekyll")
+    assert "wp2static: unmapped PHP" in out
+    assert "{% boom %}" not in out
+    assert "{{ kaboom }}" not in out
 
 
 def test_transpile_preserves_balanced_control_flow():

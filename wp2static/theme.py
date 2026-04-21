@@ -271,7 +271,10 @@ def _transpile_php(php: str, target: str, unmapped: list[str]) -> str:
     if _looks_like_template_only(residue):
         return residue
     unmapped.append(original.split("\n", 1)[0].strip()[:200])
-    safe = original.replace("-->", "--&gt;")
+    safe = (original
+            .replace("{%", "{ %").replace("%}", "% }")
+            .replace("{{", "{ {").replace("}}", "} }")
+            .replace("-->", "--&gt;"))
     return f"<!-- wp2static: unmapped PHP: {safe} -->"
 
 
@@ -344,7 +347,13 @@ def _balance_control_flow(text: str, target: str) -> str:
 
 
 def _drop_tag(match: re.Match) -> str:
-    orig = match.group(0).replace("-->", "--&gt;")
+    # Both Liquid and Go html/template parse tags inside HTML comments, so
+    # the dropped tag must be defanged — otherwise the "orphan endif" note
+    # keeps tripping the very parser we were trying to protect from it.
+    orig = (match.group(0)
+            .replace("{%", "{ %").replace("%}", "% }")
+            .replace("{{", "{ {").replace("}}", "} }")
+            .replace("-->", "--&gt;"))
     return f"<!-- wp2static: dropped orphan {orig} -->"
 
 
