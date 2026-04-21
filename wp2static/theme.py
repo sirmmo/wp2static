@@ -10,7 +10,7 @@ The scope is deliberately modest:
        language (Liquid for Jekyll, Go html/template for Hugo) using a
        hand-written token map for the most common WordPress template
        tags.  Anything outside that map is preserved as an
-       ``<!-- wp2static: unmapped ... -->`` comment so it's visible.
+       ``/*wp2static unmapped: ...*/`` marker so it's visible.
     4. Emit a per-theme ``MIGRATION.md`` listing unmapped calls and
        things we intentionally dropped (``functions.php``, widgets,
        customizer mods).
@@ -126,16 +126,16 @@ _RULES: list[_Rule] = [
 
     # language_attributes, body_class, post_class, site_url, home_url
     _rule(r"""language_attributes\s*\(\s*\)""",
-          r"""lang="{{ site.lang | default: 'en' }}\"""",
-          r"""lang=\"{{ .Site.Language.Lang }}\""""),
+          '''lang="{{ site.lang | default: 'en' }}"''',
+          '''lang="{{ .Site.Language.Lang }}"'''),
     _rule(r"""body_class\s*\(\s*\)""",
-          r"""class="{{ page.body_class | default: 'page' }}\"""",
-          r"""class=\"{{ .Params.body_class | default \"page\" }}\""""),
+          '''class="{{ page.body_class | default: 'page' }}"''',
+          '''class="{{ .Params.body_class | default "page" }}"'''),
     _rule(r"""post_class\s*\(\s*\)""",
-          r"""class="{{ include.post_class | default: 'post' }}\"""",
-          r"""class=\"{{ .Params.post_class | default \"post\" }}\""""),
+          '''class="{{ include.post_class | default: 'post' }}"''',
+          '''class="{{ .Params.post_class | default "post" }}"'''),
     _rule(r"""home_url\s*\(\s*['"]/?['"]\s*\)""",
-          r"{{ '/' | absolute_url }}", r"""{{ \"/\" | absURL }}"""),
+          r"{{ '/' | absolute_url }}", '''{{ "/" | absURL }}'''),
     _rule(r"""site_url\s*\(\s*\)""",
           r"{{ site.url }}", r"{{ .Site.BaseURL }}"),
 
@@ -156,8 +156,8 @@ _RULES: list[_Rule] = [
     _rule(r"""get_permalink\s*\(\s*\)""",
           r"{{ page.url | absolute_url }}", r"{{ .Permalink }}"),
     _rule(r"""the_post_thumbnail\s*\(\s*[^)]*\)""",
-          r"{% if page.image %}<img src=\"{{ page.image | relative_url }}\" alt=\"{{ page.title | escape }}\">{% endif %}",
-          r"{{ with .Params.image }}<img src=\"{{ . | relURL }}\" alt=\"{{ $.Title }}\">{{ end }}"),
+          '''{% if page.image %}<img src="{{ page.image | relative_url }}" alt="{{ page.title | escape }}">{% endif %}''',
+          '''{{ with .Params.image }}<img src="{{ . | relURL }}" alt="{{ $.Title }}">{{ end }}'''),
     _rule(r"""has_post_thumbnail\s*\(\s*\)""",
           r"page.image", r".Params.image"),
 
@@ -202,7 +202,7 @@ _RULES: list[_Rule] = [
     # get_search_form is close enough to a search include
     _rule(r"""get_search_form\s*\(\s*\)""",
           r"{% include searchform.html %}",
-          r"""{{ partial \"searchform.html\" . }}"""),
+          '''{{ partial "searchform.html" . }}'''),
 ]
 
 
@@ -271,20 +271,46 @@ def _transpile_php(php: str, target: str, unmapped: list[str]) -> str:
     if _looks_like_template_only(residue):
         return residue
     unmapped.append(original.split("\n", 1)[0].strip()[:200])
-    safe = (original
-            .replace("{%", "{ %").replace("%}", "% }")
-            .replace("{{", "{ {").replace("}}", "} }")
-            .replace("-->", "--&gt;"))
-    return f"<!-- wp2static: unmapped PHP: {safe} -->"
+    # Emit a marker that's safe inside both HTML body text *and* HTML
+    # attribute values. An HTML-comment wrapper isn't safe in attributes —
+    # Hugo's html/template rejects `<` appearing inside an attribute name,
+    # and Liquid would still parse any `{% %}` inside it — so scrub the
+    # characters that either parser might react to.
+    snippet = (original.split("\n", 1)[0][:200]
+               .replace("<", " ").replace(">", " ")
+               .replace('"', " ").replace("'", " ")
+               .replace("{", " ").replace("}", " "))
+    return f"/*wp2static unmapped: {' '.join(snippet.split())}*/"
 
 
 _TEMPLATE_TOKEN_RE = re.compile(r"(\{\{.*?\}\}|\{%.*?%\}|<!--.*?-->)", re.DOTALL)
+_QUOTED_STRING_RE = re.compile(r'"[^"]*"|\'[^\']*\'')
+_PHP_RESIDUE_RE = re.compile(
+    r"\$\w+"                                       # $variable
+    r"|->\w|::\w"                                  # member / static access
+    r"|\b(?:echo|print|if|else|elseif|endif|while|endwhile"
+    r"|foreach|endforeach|for|endfor|function|return"
+    r"|isset|empty|array)\b"                       # control flow & intrinsics
+    r"|(?<![-\w.])\w+\s*\("                        # bare function call
+)
 
 
 def _looks_like_template_only(text: str) -> bool:
-    """True if ``text`` is made up entirely of SSG template tags / comments."""
-    stripped = _TEMPLATE_TOKEN_RE.sub("", text).strip()
-    return stripped == ""
+    """True if no identifiable PHP construct remains in ``text``.
+
+    After the rule table runs, a translated block is a mix of plain text,
+    HTML, SSG template tokens, and (sometimes) the attribute scaffolding
+    a rule wraps around them — e.g. ``class="{{ .Params.body_class }}"``.
+    We can't simply check "is there any non-template text?", because the
+    mix is intentional. Instead, scrub template tokens, HTML comments,
+    and quoted string literals, then look for anything that still reads
+    as PHP: variables, member access, control keywords, or a bare
+    function call. If none of those survive, the block transpiled
+    cleanly and is safe to emit.
+    """
+    scrubbed = _TEMPLATE_TOKEN_RE.sub(" ", text)
+    scrubbed = _QUOTED_STRING_RE.sub(" ", scrubbed)
+    return _PHP_RESIDUE_RE.search(scrubbed) is None
 
 
 def transpile_template(php: str, target: str) -> tuple[str, list[str]]:
@@ -347,14 +373,15 @@ def _balance_control_flow(text: str, target: str) -> str:
 
 
 def _drop_tag(match: re.Match) -> str:
-    # Both Liquid and Go html/template parse tags inside HTML comments, so
-    # the dropped tag must be defanged — otherwise the "orphan endif" note
-    # keeps tripping the very parser we were trying to protect from it.
-    orig = (match.group(0)
-            .replace("{%", "{ %").replace("%}", "% }")
-            .replace("{{", "{ {").replace("}}", "} }")
-            .replace("-->", "--&gt;"))
-    return f"<!-- wp2static: dropped orphan {orig} -->"
+    # Use a plain `/*…*/` marker rather than an HTML comment: the orphan
+    # tag can land anywhere (attribute value, body text, inside a Go
+    # template expression that somehow survived), and an HTML-comment
+    # wrapper isn't universally safe — Hugo's html/template refuses `<`
+    # in attribute names, and Liquid still parses `{% %}` inside HTML
+    # comments. Record only the tag verb ("endif", "end", …) so neither
+    # parser sees a live template token.
+    tag = match.group(1)
+    return f"/*wp2static dropped orphan {tag}*/"
 
 
 def _balance_jekyll(text: str) -> str:
@@ -711,7 +738,7 @@ def _write_migration_notes(
     lines.append("")
     lines.append(
         "Search the generated templates for "
-        "`wp2static: unmapped` to find each occurrence in context."
+        "`wp2static unmapped` to find each occurrence in context."
     )
     (theme_root / "MIGRATION.md").write_text("\n".join(lines) + "\n",
                                              encoding="utf-8")

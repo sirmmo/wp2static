@@ -99,6 +99,26 @@ def test_transpile_rewrites_core_tags_for_hugo():
     assert "{{ .Content }}" in out
 
 
+def test_hugo_replacements_emit_no_stray_backslashes():
+    # Go's html/template parser rejects `\"` inside `{{ … }}` ("unexpected
+    # `\\` in command"), and stray backslashes elsewhere leak into HTML
+    # attributes. Check the core rewrites all emit clean double quotes.
+    php = (
+        "<html <?php language_attributes(); ?>>\n"
+        "<body <?php body_class(); ?>>\n"
+        "<a href='<?php home_url('/'); ?>'>home</a>\n"
+        "<?php the_post_thumbnail(); ?>\n"
+        "<?php get_search_form(); ?>\n"
+        "</body></html>"
+    )
+    out, _ = transpile_template(php, "hugo")
+    assert "\\\"" not in out
+    # Spot-check that the usual patterns are there in their clean shape.
+    assert 'lang="{{ .Site.Language.Lang }}"' in out
+    assert '{{ "/" | absURL }}' in out
+    assert '{{ partial "searchform.html" . }}' in out
+
+
 def test_transpile_expands_get_header_and_template_parts():
     php = "<?php get_header(); ?>\n<?php get_template_part('content', 'single'); ?>"
     jekyll, _ = transpile_template(php, "jekyll")
@@ -112,13 +132,8 @@ def test_transpile_expands_get_header_and_template_parts():
 def test_transpile_marks_unmapped_calls():
     php = "<?php bard_options('layout'); ?>"
     out, unmapped = transpile_template(php, "jekyll")
-    assert "wp2static: unmapped PHP" in out
+    assert "wp2static unmapped" in out
     assert any("bard_options" in call for call in unmapped)
-
-
-def _strip_comments(html: str) -> str:
-    import re as _re
-    return _re.sub(r"<!--.*?-->", "", html, flags=_re.DOTALL)
 
 
 def test_transpile_drops_orphan_jekyll_endif():
@@ -126,9 +141,8 @@ def test_transpile_drops_orphan_jekyll_endif():
     # loop swallows the `if (have_posts()):` opener as an unmapped comment,
     # but the later standalone `<?php endif; ?>` does translate — leaving a
     # dangling `{% endif %}` that Liquid rejects. The balancer must rewrite
-    # the orphan into a defanged comment, not a live tag. Liquid parses
-    # `{% ... %}` even inside HTML comments, so the braces themselves must
-    # be broken up in the dropped-tag text.
+    # the orphan into a marker that doesn't itself read as a tag to any
+    # parser (Liquid, Go html/template, or HTML's attribute tokeniser).
     php = (
         "<?php if (have_posts()) : while (have_posts()) : the_post();\n"
         "  bard_options('x'); endwhile; else: ?>\n"
@@ -136,30 +150,47 @@ def test_transpile_drops_orphan_jekyll_endif():
         "<?php endif; ?>"
     )
     out, _ = transpile_template(php, "jekyll")
-    assert "wp2static: dropped orphan { % endif % }" in out
-    # No live `{% endif %}` appears anywhere — not even inside a comment,
-    # because Liquid would still parse it there.
+    assert "wp2static dropped orphan endif" in out
+    # No live `{% endif %}` survives anywhere in the output.
     assert "{% endif %}" not in out
+    # And nothing HTML-comment-shaped either, so the marker is safe if it
+    # ends up inside an attribute value.
+    assert "<!--" not in out or "wp2static" not in out.split("<!--", 1)[1]
 
 
 def test_transpile_drops_orphan_hugo_end():
     php = "<?php endif; ?>"   # rule table emits {{ end }} with no opener
     out, _ = transpile_template(php, "hugo")
-    assert "wp2static: dropped orphan { { end } }" in out
-    # Hugo also parses `{{ ... }}` inside HTML comments, so the raw tag
-    # must not appear anywhere in the output.
+    assert "wp2static dropped orphan end" in out
     assert "{{ end }}" not in out
 
 
-def test_unmapped_php_comment_defangs_template_braces():
-    # Some theme PHP emits strings that contain `{%` / `{{` — if they land
-    # inside the unmapped-PHP comment verbatim, Liquid/Hugo will try to
-    # parse them. The comment writer must defang those braces too.
-    php = "<?php echo '{% boom %} {{ kaboom }}'; bard_options('x'); ?>"
+def test_unmapped_php_marker_strips_template_and_html_syntax():
+    # Some theme PHP emits strings that contain `{%` / `{{` or HTML
+    # delimiters. Whatever we record for later debugging must not contain
+    # characters that either the SSG template parser or an HTML attribute
+    # tokeniser would react to.
+    php = "<?php echo '{% boom %} {{ kaboom }} <x y=\"z\">'; bard_options('x'); ?>"
     out, _ = transpile_template(php, "jekyll")
-    assert "wp2static: unmapped PHP" in out
-    assert "{% boom %}" not in out
-    assert "{{ kaboom }}" not in out
+    assert "wp2static unmapped" in out
+    for forbidden in ("{% boom %}", "{{ kaboom }}", "<x", 'y="z"'):
+        assert forbidden not in out
+
+
+def test_unmapped_php_marker_is_attribute_safe_on_hugo():
+    # The Hugo html/template parser refuses `<` or `"` inside attribute
+    # values, so any unmapped-PHP marker that ends up in an attribute
+    # value must not contain either.
+    php = '<div class="<?php weird_fn(); ?>">hi</div>'
+    out, _ = transpile_template(php, "hugo")
+    # Pull out the `class="..."` value.
+    import re as _re
+    m = _re.search(r'class="([^"]*)"', out)
+    assert m is not None
+    value = m.group(1)
+    assert "<" not in value
+    assert '"' not in value
+    assert "wp2static unmapped" in value
 
 
 def test_stub_missing_includes_jekyll(tmp_path: Path):
@@ -206,6 +237,6 @@ def test_transpile_preserves_balanced_control_flow():
     )
     out, _ = transpile_template(php, "jekyll")
     # Balanced open + close are preserved; nothing is dropped.
-    assert "wp2static: dropped orphan" not in out
+    assert "wp2static dropped orphan" not in out
     assert "{% for page in paginator.posts %}" in out
     assert "{% endfor %}" in out
