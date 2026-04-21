@@ -506,6 +506,54 @@ def _hugo_layout_for(slug: str, php_path: Path) -> Path | None:
     return theme_root / "layouts" / "partials" / php_path.with_suffix(".html")
 
 
+# `{% include foo.html %}` / `{% include foo/bar.html %}`. The path segment
+# ends at the first whitespace or `%`. Liquid tolerates a trailing dash.
+_JEKYLL_INCLUDE_RE = re.compile(r"\{%-?\s*include\s+([^\s%}]+)")
+_HUGO_PARTIAL_RE = re.compile(r'\{\{-?\s*partial\s+"([^"]+)"')
+
+
+def _stub_missing_includes(out_dir: Path, slug: str, target: str) -> int:
+    """Create empty stub files for any referenced include that wasn't emitted.
+
+    WordPress's ``get_search_form()`` / ``get_header()`` / ``get_template_part()``
+    don't require a matching ``searchform.php`` / ``header.php`` / partial on
+    disk — WP falls back to built-ins. The transpiler faithfully rewrites
+    those calls into ``{% include %}`` / ``{{ partial }}`` directives, which
+    *do* require the file to exist or the SSG refuses to build. Walk the
+    generated tree, collect every referenced include, and drop a visible
+    stub for each one the theme never provided.
+    """
+    if target == "hugo":
+        walk_root = out_dir / "themes" / slug / "layouts"
+        include_root = out_dir / "themes" / slug / "layouts" / "partials"
+        pattern = _HUGO_PARTIAL_RE
+    else:
+        walk_root = out_dir
+        include_root = out_dir / "_includes"
+        pattern = _JEKYLL_INCLUDE_RE
+    if not walk_root.is_dir():
+        return 0
+    refs: set[str] = set()
+    for p in walk_root.rglob("*.html"):
+        if not p.is_file():
+            continue
+        text = p.read_text(encoding="utf-8", errors="replace")
+        for m in pattern.finditer(text):
+            refs.add(m.group(1).strip().strip('"\''))
+    stubs = 0
+    for ref in refs:
+        dst = include_root / ref
+        if dst.exists():
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_text(
+            f"<!-- wp2static: stub for missing include '{ref}' -->\n",
+            encoding="utf-8",
+        )
+        stubs += 1
+    return stubs
+
+
 def _default_front_matter(target: str, layout_kind: str | None) -> str:
     if not layout_kind:
         return ""
@@ -615,10 +663,13 @@ def migrate_active_theme(
         dst.write_text(front + body, encoding="utf-8")
         templates_written += 1
 
+    stubs_written = _stub_missing_includes(out_dir, slug, target)
+
     _write_migration_notes(theme_root, slug, meta, all_unmapped, target)
 
     return {
         "skipped": False,
+        "stubs_written": stubs_written,
         "slug": slug,
         "name": meta.name,
         "target": target,

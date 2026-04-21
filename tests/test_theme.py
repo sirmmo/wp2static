@@ -7,6 +7,7 @@ from pathlib import Path
 from wp2static.theme import (
     _hugo_layout_for,
     _jekyll_layout_for,
+    _stub_missing_includes,
     parse_style_css,
     transpile_template,
 )
@@ -159,6 +160,42 @@ def test_unmapped_php_comment_defangs_template_braces():
     assert "wp2static: unmapped PHP" in out
     assert "{% boom %}" not in out
     assert "{{ kaboom }}" not in out
+
+
+def test_stub_missing_includes_jekyll(tmp_path: Path):
+    # A layout references two includes; one already exists, the other must
+    # be stubbed out so Jekyll can build.
+    (tmp_path / "_layouts").mkdir()
+    (tmp_path / "_layouts" / "home.html").write_text(
+        "{% include searchform.html %}\n"
+        "{% include templates/sidebars/sidebar-left.html %}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "_includes" / "templates" / "sidebars").mkdir(parents=True)
+    (tmp_path / "_includes" / "templates" / "sidebars" / "sidebar-left.html").write_text(
+        "real sidebar", encoding="utf-8",
+    )
+    count = _stub_missing_includes(tmp_path, "demo", "jekyll")
+    assert count == 1
+    stub = tmp_path / "_includes" / "searchform.html"
+    assert stub.is_file()
+    assert "stub for missing include" in stub.read_text(encoding="utf-8")
+    # The real one is not overwritten.
+    real = (tmp_path / "_includes" / "templates" / "sidebars" / "sidebar-left.html")
+    assert real.read_text(encoding="utf-8") == "real sidebar"
+
+
+def test_stub_missing_includes_hugo(tmp_path: Path):
+    layouts = tmp_path / "themes" / "demo" / "layouts"
+    layouts.mkdir(parents=True)
+    (layouts / "_default").mkdir()
+    (layouts / "_default" / "single.html").write_text(
+        '{{ partial "header.html" . }}\n',
+        encoding="utf-8",
+    )
+    count = _stub_missing_includes(tmp_path, "demo", "hugo")
+    assert count == 1
+    assert (layouts / "partials" / "header.html").is_file()
 
 
 def test_transpile_preserves_balanced_control_flow():
