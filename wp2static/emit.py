@@ -118,6 +118,51 @@ def _front_page(site: Site) -> Post | None:
     return None
 
 
+def _write_site_config(opts: EmitOptions, site: Site) -> int:
+    """Write the SSG root config file (``hugo.toml`` / ``_config.yml``).
+
+    Populated from the WordPress options so the generated tree works out of
+    the box. Never overwritten if the user has already customised it.
+    """
+    base_url = opts.base_url or site.base_url or ""
+    title = site.site_name or "Site"
+    theme = site.active_theme or ""
+    description = site.site_description or ""
+    if opts.target == "hugo":
+        cfg = opts.out_dir / "hugo.toml"
+        if cfg.exists():
+            return 0
+        lines = [
+            f'baseURL = "{base_url}/"' if base_url else 'baseURL = "/"',
+            f'title = "{_toml_escape(title)}"',
+            'languageCode = "en-us"',
+        ]
+        if theme:
+            lines.append(f'theme = "{_toml_escape(theme)}"')
+        if description:
+            lines.append("[params]")
+            lines.append(f'  description = "{_toml_escape(description)}"')
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        cfg.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return 1
+    # jekyll
+    cfg = opts.out_dir / "_config.yml"
+    if cfg.exists():
+        return 0
+    data = {
+        "title": title,
+        "description": description,
+        "url": base_url,
+    }
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text(_dump_yaml(data), encoding="utf-8")
+    return 1
+
+
+def _toml_escape(s: str) -> str:
+    return (s or "").replace("\\", "\\\\").replace('"', '\\"')
+
+
 def _write_index(
     opts: EmitOptions, site: Site, front_page: Post | None, front_body: str,
 ) -> int:
@@ -205,6 +250,7 @@ def emit(site: Site, opts: EmitOptions) -> dict:
             written_pages += 1
 
     indexes_written = _write_index(opts, site, front_page, front_body)
+    config_written = _write_site_config(opts, site)
 
     templates_copied = 0
     if opts.install_templates:
@@ -242,4 +288,5 @@ def emit(site: Site, opts: EmitOptions) -> dict:
         "uploads_copied": copied,
         "templates_copied": templates_copied,
         "indexes_written": indexes_written,
+        "config_written": config_written,
     }

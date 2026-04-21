@@ -82,6 +82,46 @@ def test_front_page_replaces_index_and_suppresses_page_file(tmp_path: Path):
     assert stats["pages"] == 1
 
 
+def test_hugo_writes_site_config_with_wp_options(tmp_path: Path):
+    site = _make_site(active_theme="kale")
+    stats = emit(site, EmitOptions(
+        out_dir=tmp_path, target="hugo", install_templates=False,
+    ))
+    cfg = tmp_path / "hugo.toml"
+    assert cfg.is_file()
+    assert stats["config_written"] == 1
+    body = cfg.read_text(encoding="utf-8")
+    assert 'baseURL = "https://example.com/"' in body
+    assert 'title = "Example"' in body
+    assert 'theme = "kale"' in body
+    assert 'description = "An example site"' in body
+
+
+def test_jekyll_writes_site_config_with_wp_options(tmp_path: Path):
+    site = _make_site()
+    stats = emit(site, EmitOptions(
+        out_dir=tmp_path, target="jekyll", install_templates=False,
+    ))
+    cfg = tmp_path / "_config.yml"
+    assert cfg.is_file()
+    assert stats["config_written"] == 1
+    body = cfg.read_text(encoding="utf-8")
+    assert "title: Example" in body
+    assert "url: https://example.com" in body
+
+
+def test_site_config_is_not_overwritten_if_user_has_customised_it(tmp_path: Path):
+    (tmp_path / "hugo.toml").write_text(
+        'title = "Custom"\n', encoding="utf-8",
+    )
+    site = _make_site(active_theme="kale")
+    stats = emit(site, EmitOptions(
+        out_dir=tmp_path, target="hugo", install_templates=False,
+    ))
+    assert stats["config_written"] == 0
+    assert (tmp_path / "hugo.toml").read_text(encoding="utf-8") == 'title = "Custom"\n'
+
+
 def test_jekyll_front_page_uses_home_layout(tmp_path: Path):
     site = _make_site(show_on_front="page", page_on_front=1)
     emit(site, EmitOptions(
