@@ -66,14 +66,15 @@ docker run --rm \
         # --table-prefix wp_       # if the dump uses a non-default prefix
 ```
 
-For the reference dump at `/srv/burroeansia.it/`:
+A fuller invocation that also pulls in uploads and scaffolds the active
+theme:
 
 ```bash
 docker run --rm \
-    -v /srv/burroeansia.it:/data:ro \
+    -v /path/to/site:/data:ro \
     -v "$PWD/site":/out \
     wp2static \
-        --sql /data/burroeansia.sql \
+        --sql /data/dump.sql \
         --uploads /data/wp-content/uploads \
         --themes-dir /data/wp-content/themes \
         --out /out \
