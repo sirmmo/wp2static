@@ -34,30 +34,22 @@ resulting static site can be built by any CI runner (or locally).
 Ignored on purpose: comments, revisions, drafts, authors, custom
 post types, `functions.php`, widget areas, Customizer mods.
 
-## Getting the source
-
-```bash
-git clone https://github.com/sirmmo/wp2static.git
-cd wp2static
-```
-
-## Build the image
-
-```bash
-docker build -t wp2static .
-```
-
 ## Usage
+
+The runtime image is published to the GitHub Container Registry on
+every push to `main` and every `v*` tag, so you can run it without
+cloning or building anything:
 
 ```bash
 docker run --rm \
     -v /path/to/dump:/data:ro \
     -v "$PWD/site":/out \
-    wp2static \
+    ghcr.io/sirmmo/wp2static:latest \
         --sql /data/dump.sql \
         --uploads /data/wp-content/uploads \
         --out /out \
         --target jekyll            # or: hugo
+        # --xml /data/export.xml   # use a WXR export instead of --sql
         # --markdown               # convert HTML → Markdown
         # --no-templates           # skip starter gallery template
         # --themes-dir /data/wp-content/themes   # scaffold active theme
@@ -66,6 +58,13 @@ docker run --rm \
         # --table-prefix wp_       # if the dump uses a non-default prefix
 ```
 
+Available tags:
+
+- `latest` — head of `main`
+- `main` — same thing, explicit
+- `vX.Y.Z` / `vX.Y` — release tags
+- `sha-<short>` — pinned to a specific commit
+
 A fuller invocation that also pulls in uploads and scaffolds the active
 theme:
 
@@ -73,13 +72,44 @@ theme:
 docker run --rm \
     -v /path/to/site:/data:ro \
     -v "$PWD/site":/out \
-    wp2static \
+    ghcr.io/sirmmo/wp2static:latest \
         --sql /data/dump.sql \
         --uploads /data/wp-content/uploads \
         --themes-dir /data/wp-content/themes \
         --out /out \
         --target hugo -v
 ```
+
+### WXR (XML) exports
+
+If you don't have database access, point `--xml` at a
+`Tools → Export` WXR file instead of `--sql`. The XML path gives up
+`wp_options`-only data (active theme, `siteurl`, theme mods, FinalTiles
+galleries), but posts, pages, attachments, categories, tags and nav
+menus all come through.
+
+```bash
+docker run --rm \
+    -v /path/to/export:/data:ro \
+    -v "$PWD/site":/out \
+    ghcr.io/sirmmo/wp2static:latest \
+        --xml /data/site.WordPress.xml \
+        --out /out --target hugo -v
+```
+
+### Building the image locally
+
+Only needed if you're hacking on wp2static itself; the published image
+covers normal use.
+
+```bash
+git clone https://github.com/sirmmo/wp2static.git
+cd wp2static
+docker build --target runtime -t wp2static .
+```
+
+Then swap `ghcr.io/sirmmo/wp2static:latest` for `wp2static` in the
+commands above.
 
 ## Output layout
 
@@ -135,6 +165,15 @@ include:
 
 PRs should include tests under `tests/` exercising the behaviour you
 are changing, and keep the Docker-first workflow intact.
+
+## Publishing notes (maintainers)
+
+The first successful workflow run creates the container package in
+GHCR as **private**. To make `ghcr.io/sirmmo/wp2static` pullable without
+authentication, open the package page
+(<https://github.com/sirmmo/wp2static/pkgs/container/wp2static>),
+pick **Package settings → Change visibility → Public**, and confirm.
+This is a one-time step; subsequent pushes keep the visibility.
 
 ## Licence
 
