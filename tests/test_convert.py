@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from wp2static.convert import (
-    _strip_thumbnail_suffix,
     clean_content,
     extract_upload_paths,
     resolve_galleries,
@@ -11,6 +10,7 @@ from wp2static.convert import (
     strip_shortcodes,
     wpautop,
 )
+from wp2static.plugins.final_tiles import _strip_thumbnail_suffix
 from wp2static.wpdata import Attachment, Gallery
 
 

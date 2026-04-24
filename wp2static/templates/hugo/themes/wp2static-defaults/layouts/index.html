@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="{{ .Site.Language.Lang }}">
+<head>
+<meta charset="utf-8">
+<title>{{ .Title | default .Site.Title }}</title>
+{{ partial "wp2static-head.html" . }}
+</head>
+<body>
+<h1>{{ .Title | default .Site.Title }}</h1>
+{{ with .Content }}
+<article class="wp2static-home-content">
+  {{ . }}
+</article>
+{{ end }}
+{{ $posts := where .Site.RegularPages "Section" "posts" }}
+{{ with $posts }}
+<section class="wp2static-home-posts">
+  <h2>Posts</h2>
+  <ul>
+  {{ range first 10 . }}
+    <li>
+      <a href="{{ .Permalink }}">{{ .Title }}</a>
+      {{ with .Date }}<time datetime="{{ .Format "2006-01-02" }}">{{ .Format "2006-01-02" }}</time>{{ end }}
+    </li>
+  {{ end }}
+  </ul>
+</section>
+{{ end }}
+</body>
+</html>

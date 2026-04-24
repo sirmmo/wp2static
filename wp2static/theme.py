@@ -17,6 +17,11 @@ The scope is deliberately modest:
 
 This is **not** a full port — it produces a scaffold that needs a pass
 from a human to become a working theme.
+
+Target-specific details (layout paths, include syntax, markers, balancer,
+metadata format, stubs) are owned by :class:`~wp2static.targets.Target`;
+this module holds the source-side pieces that are the same regardless of
+which SSG we emit for.
 """
 
 from __future__ import annotations
@@ -26,6 +31,8 @@ import re
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from .targets import Target, get_target
 
 log = logging.getLogger(__name__)
 
@@ -164,10 +171,6 @@ _RULES: list[_Rule] = [
     _rule(r"""has_post_thumbnail\s*\(\s*\)""",
           r"page.image", r".Params.image"),
 
-    # template parts / layout helpers — handled separately below so we can
-    # concatenate the two args; leave a placeholder that _compose can spot.
-    # (Nothing here; see _rewrite_template_parts.)
-
     # wp_head / wp_footer / wp_body_open — static sites don't need these
     _rule(r"""wp_head\s*\(\s*\)""",
           r"<!-- wp2static: site head -->",
@@ -202,10 +205,9 @@ _RULES: list[_Rule] = [
     _rule(r"""is_paged\s*\(\s*\)""",
           r"paginator.page > 1", r"gt .Paginator.PageNumber 1"),
 
-    # get_search_form is close enough to a search include
-    _rule(r"""get_search_form\s*\(\s*\)""",
-          r"{% include searchform.html %}",
-          "{{ partial `searchform.html` . }}"),
+    # get_search_form is close enough to a search include — include directive
+    # is target-specific, so we defer to Target.include_directive via the
+    # _GET_SEARCH_FORM_RE rewriter below rather than a straight substitution.
 ]
 
 
@@ -215,33 +217,35 @@ _GET_SIDEBAR_RE = re.compile(r"""get_sidebar\s*\(\s*(?:['"]([^'"]*)['"])?\s*\)""
 _GET_TEMPLATE_PART_RE = re.compile(
     r"""get_template_part\s*\(\s*['"]([^'"]+)['"]\s*(?:,\s*['"]([^'"]*)['"]\s*)?\)""",
 )
+_GET_SEARCH_FORM_RE = re.compile(r"""get_search_form\s*\(\s*\)""")
 
 
-def _include(target: str, slug: str) -> str:
-    slug = slug.replace("\\", "/").strip("/")
-    if target == "hugo":
-        # Backtick-quoted string literal so the partial call is safe even
-        # if it lands inside an HTML `"…"` attribute value.
-        return "{{ partial `" + slug + ".html` . }}"
-    return f'{{% include {slug}.html %}}'
-
-
-def _rewrite_template_parts(php: str, target: str) -> str:
+def _rewrite_template_parts(php: str, target: Target) -> str:
     def _tp(match: re.Match) -> str:
         name, part = match.group(1), match.group(2)
         slug = f"{name}-{part}" if part else name
-        return _include(target, slug)
+        return target.include_directive(slug)
     php = _GET_TEMPLATE_PART_RE.sub(_tp, php)
     php = _GET_HEADER_RE.sub(
-        lambda m: _include(target, f"header-{m.group(1)}" if m.group(1) else "header"),
+        lambda m: target.include_directive(
+            f"header-{m.group(1)}" if m.group(1) else "header",
+        ),
         php,
     )
     php = _GET_FOOTER_RE.sub(
-        lambda m: _include(target, f"footer-{m.group(1)}" if m.group(1) else "footer"),
+        lambda m: target.include_directive(
+            f"footer-{m.group(1)}" if m.group(1) else "footer",
+        ),
         php,
     )
     php = _GET_SIDEBAR_RE.sub(
-        lambda m: _include(target, f"sidebar-{m.group(1)}" if m.group(1) else "sidebar"),
+        lambda m: target.include_directive(
+            f"sidebar-{m.group(1)}" if m.group(1) else "sidebar",
+        ),
+        php,
+    )
+    php = _GET_SEARCH_FORM_RE.sub(
+        lambda m: target.include_directive("searchform"),
         php,
     )
     return php
@@ -249,7 +253,7 @@ def _rewrite_template_parts(php: str, target: str) -> str:
 
 # --- transpiler -------------------------------------------------------------
 
-def _transpile_php(php: str, target: str, unmapped: list[str]) -> str:
+def _transpile_php(php: str, target: Target, unmapped: list[str]) -> str:
     """Rewrite a single ``<?php … ?>`` block.
 
     Things the rule table can handle are substituted in place; the remaining
@@ -260,8 +264,7 @@ def _transpile_php(php: str, target: str, unmapped: list[str]) -> str:
     original = php.strip()
     php = _rewrite_template_parts(php, target)
     for rule in _RULES:
-        repl = rule.replace_hugo if target == "hugo" else rule.replace_jekyll
-        php = rule.pattern.sub(repl, php)
+        php = rule.pattern.sub(target.replacement_for(rule), php)
 
     # Clean up some PHP artefacts we can safely drop.
     php = re.sub(r"\becho\s+", "", php)
@@ -276,24 +279,7 @@ def _transpile_php(php: str, target: str, unmapped: list[str]) -> str:
     if _looks_like_template_only(residue):
         return residue
     unmapped.append(original.split("\n", 1)[0].strip()[:200])
-    return _marker(original.split("\n", 1)[0][:200], target, "unmapped")
-
-
-def _marker(raw: str, target: str, kind: str) -> str:
-    """Render a marker in the SSG's own comment syntax.
-
-    Both Liquid's ``{% comment %} … {% endcomment %}`` and Go's
-    ``{{/* … */}}`` render to the empty string, so the marker is safe
-    anywhere in the output — body text, HTML attribute values, between
-    a tag name and its attributes — without confusing the HTML-aware
-    parsers the way raw ``<!-- -->`` or ``/* */`` wrappers would.
-    """
-    body = (raw.replace("{", " ").replace("}", " ")
-               .replace("*/", " ").replace("%}", " "))
-    body = " ".join(body.split())
-    if target == "hugo":
-        return "{{/* wp2static " + kind + ": " + body + " */}}"
-    return "{% comment %}wp2static " + kind + ": " + body + "{% endcomment %}"
+    return target.marker(original.split("\n", 1)[0][:200], "unmapped")
 
 
 _TEMPLATE_TOKEN_RE = re.compile(r"(\{\{.*?\}\}|\{%.*?%\}|<!--.*?-->)", re.DOTALL)
@@ -326,11 +312,15 @@ def _looks_like_template_only(text: str) -> bool:
     return _PHP_RESIDUE_RE.search(scrubbed) is None
 
 
-def transpile_template(php: str, target: str) -> tuple[str, list[str]]:
+def transpile_template(php: str, target) -> tuple[str, list[str]]:
     """Transpile a full ``.php`` file to a Jekyll / Hugo template string.
+
+    ``target`` may be a target name (``"jekyll"`` / ``"hugo"``) or an
+    already-resolved :class:`Target` instance.
 
     Returns ``(output, unmapped_calls)``.
     """
+    tgt = get_target(target)
     unmapped: list[str] = []
     out = []
     i = 0
@@ -345,107 +335,14 @@ def transpile_template(php: str, target: str) -> tuple[str, list[str]]:
         if not end:
             # Unterminated <?php — treat the rest as PHP.
             block = php[m.end():]
-            out.append(_transpile_php(block, target, unmapped))
+            out.append(_transpile_php(block, tgt, unmapped))
             break
         block = php[m.end():end.start()]
-        out.append(_transpile_php(block, target, unmapped))
+        out.append(_transpile_php(block, tgt, unmapped))
         i = end.end()
     body = "".join(out)
-    body = _balance_control_flow(body, target)
+    body = tgt.balance_control_flow(body)
     return body, unmapped
-
-
-# --- control-flow balancing -------------------------------------------------
-#
-# Rule-based PHP translation can leave orphan control tags in the output: e.g.
-# a ``<?php if (have_posts()): while... endwhile; else: ?>`` block that also
-# contains untranslatable PHP collapses into one unmapped comment, but the
-# paired ``<?php endif; ?>`` later on is standalone and *does* translate — so
-# the resulting template has an ``{% endif %}`` with no opener. Liquid and
-# Go's html/template both refuse to parse that. We scan the rendered output,
-# pair opens with closes, and convert anything unpaired into a comment.
-
-_JEKYLL_TAG_RE = re.compile(r"\{%-?\s*(\w+)\b[^%]*-?%\}")
-_JEKYLL_OPENS = {"if", "for", "unless", "case", "capture", "tablerow",
-                 "comment", "raw"}
-_JEKYLL_CLOSE_FOR = {
-    "endif": "if", "endfor": "for", "endunless": "unless",
-    "endcase": "case", "endcapture": "capture", "endtablerow": "tablerow",
-    "endcomment": "comment", "endraw": "raw",
-}
-_JEKYLL_CONTINUATIONS = {"else", "elsif", "when"}
-
-_HUGO_TAG_RE = re.compile(r"\{\{-?\s*(\w+)\b[^}]*-?\}\}")
-_HUGO_OPENS = {"if", "with", "range", "block", "define"}
-
-
-def _balance_control_flow(text: str, target: str) -> str:
-    if target == "hugo":
-        return _balance_hugo(text)
-    return _balance_jekyll(text)
-
-
-def _balance_jekyll(text: str) -> str:
-    matches = list(_JEKYLL_TAG_RE.finditer(text))
-    if not matches:
-        return text
-    stack: list[int] = []   # indices into ``matches`` for still-open tags
-    drop: set[int] = set()
-    for i, m in enumerate(matches):
-        tag = m.group(1)
-        if tag in _JEKYLL_OPENS:
-            stack.append(i)
-        elif tag in _JEKYLL_CLOSE_FOR:
-            want = _JEKYLL_CLOSE_FOR[tag]
-            if stack and matches[stack[-1]].group(1) == want:
-                stack.pop()
-            else:
-                drop.add(i)
-        elif tag in _JEKYLL_CONTINUATIONS and not stack:
-            drop.add(i)
-    drop.update(stack)   # any unclosed openers
-    if not drop:
-        return text
-    return _rewrite_matches(text, matches, drop, "jekyll")
-
-
-def _balance_hugo(text: str) -> str:
-    matches = list(_HUGO_TAG_RE.finditer(text))
-    if not matches:
-        return text
-    stack: list[int] = []
-    drop: set[int] = set()
-    for i, m in enumerate(matches):
-        tag = m.group(1)
-        if tag in _HUGO_OPENS:
-            stack.append(i)
-        elif tag == "end":
-            if stack:
-                stack.pop()
-            else:
-                drop.add(i)
-        elif tag == "else" and not stack:
-            drop.add(i)
-    drop.update(stack)
-    if not drop:
-        return text
-    return _rewrite_matches(text, matches, drop, "hugo")
-
-
-def _rewrite_matches(
-    text: str, matches: list[re.Match], drop: set[int], target: str,
-) -> str:
-    out: list[str] = []
-    last = 0
-    for i, m in enumerate(matches):
-        out.append(text[last:m.start()])
-        out.append(
-            _marker(m.group(1), target, "dropped orphan")
-            if i in drop else m.group(0)
-        )
-        last = m.end()
-    out.append(text[last:])
-    return "".join(out)
 
 
 # --- asset + output layout --------------------------------------------------
@@ -477,169 +374,22 @@ def _copy_static_assets(src: Path, dst: Path) -> int:
     return total
 
 
-def _jekyll_layout_for(php_path: Path) -> Path | None:
-    """Map a WP template file to a Jekyll layout/include path.
+# --- legacy module-level delegators ------------------------------------------
+#
+# The test suite (and any downstream callers) import a few helpers directly
+# from this module. Keep thin wrappers so behaviour is unchanged; the real
+# logic lives on the Target objects.
 
-    Top-level templates become ``_layouts/<name>.html``; anything under
-    ``templates/…`` or other subdirs becomes an include.
-    """
-    name = php_path.name
-    if name == "functions.php":
-        return None  # never transpile
-    top_level_layouts = {
-        "index.php": "_layouts/home.html",
-        "single.php": "_layouts/post.html",
-        "page.php": "_layouts/page.html",
-        "archive.php": "_layouts/archive.html",
-        "category.php": "_layouts/category.html",
-        "tag.php": "_layouts/tag.html",
-        "search.php": "_layouts/search.html",
-        "404.php": "_layouts/404.html",
-    }
-    if len(php_path.parts) == 1 and name in top_level_layouts:
-        return Path(top_level_layouts[name])
-    # Top-level header.php / footer.php / sidebar*.php → bare includes so
-    # `get_header()` / `get_sidebar('left')` can find them.  Nested files
-    # (e.g. `templates/sidebars/sidebar-left.php`) keep their full path so
-    # the `get_template_part(...)` call that references them resolves to
-    # the same layout the WP theme expects.
-    stem = php_path.stem
-    if len(php_path.parts) == 1 and (
-        stem in ("header", "footer") or stem.startswith("sidebar")
-    ):
-        return Path("_includes") / f"{stem}.html"
-    # everything else (incl. templates/**) → _includes preserving structure
-    return Path("_includes") / php_path.with_suffix(".html")
+def _jekyll_layout_for(php_path: Path) -> Path | None:
+    return get_target("jekyll").layout_for("", php_path)
 
 
 def _hugo_layout_for(slug: str, php_path: Path) -> Path | None:
-    name = php_path.name
-    if name == "functions.php":
-        return None
-    stem = php_path.stem
-    theme_root = Path("themes") / slug
-    top_level_layouts = {
-        "index.php": "layouts/_default/list.html",
-        "single.php": "layouts/_default/single.html",
-        "page.php": "layouts/_default/page.html",
-        "archive.php": "layouts/_default/archive.html",
-        "category.php": "layouts/_default/taxonomy.html",
-        "tag.php": "layouts/_default/term.html",
-        "search.php": "layouts/_default/search.html",
-        "404.php": "layouts/404.html",
-    }
-    if len(php_path.parts) == 1 and name in top_level_layouts:
-        return theme_root / top_level_layouts[name]
-    if len(php_path.parts) == 1 and (stem in ("header", "footer")
-                                     or stem.startswith("sidebar")):
-        return theme_root / "layouts" / "partials" / f"{stem}.html"
-    # templates/** → partials/** (same structure)
-    return theme_root / "layouts" / "partials" / php_path.with_suffix(".html")
-
-
-# `{% include foo.html %}` / `{% include foo/bar.html %}`. The path segment
-# ends at the first whitespace or `%`. Liquid tolerates a trailing dash.
-_JEKYLL_INCLUDE_RE = re.compile(r"\{%-?\s*include\s+([^\s%}]+)")
-# Hugo partial calls use either double-quoted or backtick-quoted string
-# literals for the partial path — `{{ partial "foo.html" . }}` or
-# `{{ partial `foo.html` . }}`. Match both so the stubber sees every
-# referenced partial regardless of quoting style.
-_HUGO_PARTIAL_RE = re.compile(r'\{\{-?\s*partial\s+(?:"([^"]+)"|`([^`]+)`)')
+    return get_target("hugo").layout_for(slug, php_path)
 
 
 def _stub_missing_includes(out_dir: Path, slug: str, target: str) -> int:
-    """Create empty stub files for any referenced include that wasn't emitted.
-
-    WordPress's ``get_search_form()`` / ``get_header()`` / ``get_template_part()``
-    don't require a matching ``searchform.php`` / ``header.php`` / partial on
-    disk — WP falls back to built-ins. The transpiler faithfully rewrites
-    those calls into ``{% include %}`` / ``{{ partial }}`` directives, which
-    *do* require the file to exist or the SSG refuses to build. Walk the
-    generated tree, collect every referenced include, and drop a visible
-    stub for each one the theme never provided.
-    """
-    if target == "hugo":
-        walk_root = out_dir / "themes" / slug / "layouts"
-        include_root = out_dir / "themes" / slug / "layouts" / "partials"
-        pattern = _HUGO_PARTIAL_RE
-    else:
-        walk_root = out_dir
-        include_root = out_dir / "_includes"
-        pattern = _JEKYLL_INCLUDE_RE
-    if not walk_root.is_dir():
-        return 0
-    refs: set[str] = set()
-    for p in walk_root.rglob("*.html"):
-        if not p.is_file():
-            continue
-        text = p.read_text(encoding="utf-8", errors="replace")
-        for m in pattern.finditer(text):
-            # Jekyll pattern has one group; Hugo pattern has two
-            # alternatives — pick whichever captured.
-            ref = next(g for g in m.groups() if g is not None)
-            refs.add(ref.strip().strip('"\'`'))
-    stubs = 0
-    for ref in refs:
-        dst = include_root / ref
-        if dst.exists():
-            continue
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        # SSG comment renders to the empty string, so the stub is safe
-        # even if it's included inside an HTML attribute value.
-        if target == "hugo":
-            body = f"{{{{/* wp2static stub for missing include {ref} */}}}}\n"
-        else:
-            body = (f"{{% comment %}}wp2static stub for missing include {ref}"
-                    "{% endcomment %}\n")
-        dst.write_text(body, encoding="utf-8")
-        stubs += 1
-    return stubs
-
-
-def _default_front_matter(target: str, layout_kind: str | None) -> str:
-    if not layout_kind:
-        return ""
-    if target == "hugo":
-        return ""  # Hugo layouts don't have front matter
-    return f"---\nlayout: {layout_kind}\n---\n"
-
-
-def _emit_metadata(target: str, dst: Path, slug: str, meta: ThemeMeta) -> None:
-    if target == "hugo":
-        theme_toml = dst / "theme.toml"
-        theme_toml.parent.mkdir(parents=True, exist_ok=True)
-        tags_list = ", ".join('"' + _escape_toml(t) + '"' for t in meta.tags)
-        lines = [
-            f'name = "{_escape_toml(meta.name or slug)}"',
-            f'license = "{_escape_toml(meta.license) or "unknown"}"',
-            'licenselink = ""',
-            f'description = "{_escape_toml(meta.description)}"',
-            f'homepage = "{_escape_toml(meta.uri)}"',
-            f'tags = [{tags_list}]',
-            'features = []',
-            'min_version = "0.80.0"',
-            '[author]',
-            f'  name = "{_escape_toml(meta.author)}"',
-            f'  homepage = "{_escape_toml(meta.author_uri)}"',
-        ]
-        theme_toml.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    else:
-        yml = dst / "theme.yml"
-        yml.parent.mkdir(parents=True, exist_ok=True)
-        lines = [
-            f"name: {meta.name or slug}",
-            f'description: "{_escape_toml(meta.description)}"',
-            f"version: {meta.version or '0.0.0'}",
-            f'author: "{_escape_toml(meta.author)}"',
-            f"homepage: {meta.uri}",
-            f"license: {meta.license or 'unknown'}",
-            f"tags: [{', '.join(meta.tags)}]",
-        ]
-        yml.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
-def _escape_toml(s: str) -> str:
-    return (s or "").replace("\\", "\\\\").replace('"', '\\"')
+    return get_target(target).stub_missing_includes(out_dir, slug)
 
 
 # --- public API --------------------------------------------------------------
@@ -648,6 +398,7 @@ def migrate_active_theme(
     site, themes_src: Path, out_dir: Path, target: str,
 ) -> dict:
     """Scaffold the active theme into ``out_dir``. Returns a stats dict."""
+    tgt = get_target(target)
     slug = site.active_theme
     if not slug:
         log.warning("no active theme recorded in wp_options; skipping")
@@ -659,18 +410,14 @@ def migrate_active_theme(
         return {"skipped": True, "slug": slug}
 
     meta = parse_style_css(src / "style.css")
-    log.info("migrating theme %r (%s) for %s", slug, meta.name or "no-name", target)
+    log.info("migrating theme %r (%s) for %s", slug, meta.name or "no-name", tgt.name)
 
-    if target == "hugo":
-        theme_root = out_dir / "themes" / slug
-        static_root = theme_root / "static"
-    else:
-        theme_root = out_dir
-        static_root = out_dir / "assets" / "theme"
+    theme_root = tgt.theme_root(out_dir, slug)
+    static_root = tgt.theme_static_root(out_dir, slug)
     theme_root.mkdir(parents=True, exist_ok=True)
 
     assets_copied = _copy_static_assets(src, static_root)
-    _emit_metadata(target, theme_root, slug, meta)
+    tgt.emit_theme_metadata(theme_root, slug, meta)
 
     all_unmapped: dict[str, list[str]] = {}
     templates_written = 0
@@ -681,43 +428,41 @@ def migrate_active_theme(
         if top in ("freemius", "plugins", "inc"):
             continue
 
-        dst_rel = (
-            _hugo_layout_for(slug, rel)
-            if target == "hugo"
-            else _jekyll_layout_for(rel)
-        )
+        dst_rel = tgt.layout_for(slug, rel)
         if dst_rel is None:
             continue
         dst = out_dir / dst_rel
         dst.parent.mkdir(parents=True, exist_ok=True)
 
         php_source = php_path.read_text(encoding="utf-8", errors="replace")
-        body, unmapped = transpile_template(php_source, target)
+        body, unmapped = transpile_template(php_source, tgt)
         if unmapped:
             all_unmapped[str(rel)] = unmapped
 
         front = ""
-        if target != "hugo":
+        if tgt.name != "hugo":
             stem = rel.stem
             if stem in ("index", "single", "page", "archive",
                         "category", "tag", "search", "404"):
-                front = _default_front_matter(target, "default")
+                front = tgt.default_front_matter("default")
         dst.write_text(front + body, encoding="utf-8")
         templates_written += 1
 
-    stubs_written = _stub_missing_includes(out_dir, slug, target)
+    stubs_written = tgt.stub_missing_includes(out_dir, slug)
+    finalize_stats = tgt.finalize_theme(out_dir, slug)
 
-    _write_migration_notes(theme_root, slug, meta, all_unmapped, target)
+    _write_migration_notes(theme_root, slug, meta, all_unmapped, tgt.name)
 
     return {
         "skipped": False,
         "stubs_written": stubs_written,
         "slug": slug,
         "name": meta.name,
-        "target": target,
+        "target": tgt.name,
         "assets_copied": assets_copied,
         "templates_written": templates_written,
         "templates_with_unmapped": len(all_unmapped),
+        **finalize_stats,
     }
 
 

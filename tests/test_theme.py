@@ -63,16 +63,30 @@ def test_jekyll_layout_for_maps_top_level_templates():
 
 
 def test_hugo_layout_for_puts_things_under_theme_root():
-    assert _hugo_layout_for("kale", Path("single.php")) == Path(
-        "themes/kale/layouts/_default/single.html"
-    )
+    # header/footer and nested partials still transpile — they're
+    # structural HTML, not WP-Loop-carrying.
     assert _hugo_layout_for("kale", Path("header.php")) == Path(
         "themes/kale/layouts/partials/header.html"
     )
     assert _hugo_layout_for("kale", Path("templates/sidebars/sidebar-left.php")) == Path(
         "themes/kale/layouts/partials/templates/sidebars/sidebar-left.html"
     )
+    # functions.php is never emitted.
     assert _hugo_layout_for("kale", Path("functions.php")) is None
+    # 404.php is not a Loop template — it still transpiles to a layout.
+    assert _hugo_layout_for("kale", Path("404.php")) == Path(
+        "themes/kale/layouts/404.html"
+    )
+
+
+def test_hugo_layout_for_skips_wp_loop_templates():
+    # WordPress Loop semantics (have_posts()/the_post()) have no Hugo
+    # equivalent, so the transpiled output is empty. Emitting these as
+    # live layouts shadows the wp2static-defaults fallback, which does
+    # render .Content correctly.
+    for name in ("index.php", "single.php", "page.php",
+                 "archive.php", "category.php", "tag.php", "search.php"):
+        assert _hugo_layout_for("kale", Path(name)) is None, name
 
 
 def test_transpile_rewrites_core_tags_for_jekyll():

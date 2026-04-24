@@ -1,0 +1,12 @@
+name = "wp2static fallback"
+license = "MIT"
+licenselink = ""
+description = "Bare list/single layouts that render when the migrated WordPress theme has no matching template."
+homepage = ""
+tags = []
+features = []
+min_version = "0.80.0"
+
+[author]
+  name = "wp2static"
+  homepage = ""

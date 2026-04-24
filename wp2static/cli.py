@@ -8,17 +8,25 @@ import sys
 from pathlib import Path
 
 from . import theme as theme_mod
+from . import wxr as wxr_mod
 from .emit import EmitOptions, emit
+from .plugins import import_plugins, list_adapters
+from .targets import get_target
 from .wpdata import load
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="wp2static",
-        description="Migrate a WordPress MySQL dump to a Jekyll or Hugo site tree.",
+        description="Migrate a WordPress MySQL dump or WXR export to a "
+                    "Jekyll or Hugo site tree.",
     )
-    p.add_argument("--sql", required=True, type=Path,
-                   help="path to the mysqldump .sql file")
+    src = p.add_mutually_exclusive_group(required=True)
+    src.add_argument("--sql", type=Path,
+                     help="path to the mysqldump .sql file")
+    src.add_argument("--xml", type=Path,
+                     help="path to a WordPress WXR XML export "
+                          "(Tools → Export)")
     p.add_argument("--out", required=True, type=Path,
                    help="output directory (will be created)")
     p.add_argument("--target", choices=("jekyll", "hugo"), default="jekyll",
@@ -37,6 +45,15 @@ def build_parser() -> argparse.ArgumentParser:
                         "the output tree")
     p.add_argument("--no-theme", dest="migrate_theme", action="store_false",
                    help="skip theme scaffolding even if --themes-dir is set")
+    p.add_argument("--plugins-dir", type=Path, default=None,
+                   help="path to wp-content/plugins; recognised plugins "
+                        "have their static assets imported into the "
+                        "output tree. Recognised slugs: "
+                        + ", ".join(list_adapters()))
+    p.add_argument("--plugins", default="",
+                   help="comma-separated plugin slugs to import "
+                        "(default: every recognised plugin found "
+                        "under --plugins-dir)")
     p.add_argument("--table-prefix", default="wp_",
                    help="WordPress table prefix (default: wp_)")
     p.add_argument("--base-url", default="",
@@ -51,8 +68,11 @@ def main(argv: list[str] | None = None) -> int:
     level = logging.WARNING - 10 * min(args.verbose, 2)
     logging.basicConfig(level=level, format="%(levelname)s %(name)s: %(message)s")
 
-    if not args.sql.is_file():
+    if args.sql is not None and not args.sql.is_file():
         print(f"error: SQL dump not found: {args.sql}", file=sys.stderr)
+        return 2
+    if args.xml is not None and not args.xml.is_file():
+        print(f"error: WXR export not found: {args.xml}", file=sys.stderr)
         return 2
     if args.uploads is not None and not args.uploads.is_dir():
         print(f"error: uploads directory not found: {args.uploads}", file=sys.stderr)
@@ -60,8 +80,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.themes_dir is not None and not args.themes_dir.is_dir():
         print(f"error: themes directory not found: {args.themes_dir}", file=sys.stderr)
         return 2
+    if args.plugins_dir is not None and not args.plugins_dir.is_dir():
+        print(f"error: plugins directory not found: {args.plugins_dir}", file=sys.stderr)
+        return 2
 
-    site = load(args.sql, table_prefix=args.table_prefix)
+    if args.xml is not None:
+        site = wxr_mod.load(args.xml)
+    else:
+        site = load(args.sql, table_prefix=args.table_prefix)
     opts = EmitOptions(
         out_dir=args.out,
         uploads_src=args.uploads,
@@ -78,6 +104,22 @@ def main(argv: list[str] | None = None) -> int:
         f"installed {stats['templates_copied']} template file(s) "
         f"→ {args.out}"
     )
+
+    # Plugin import runs before theme migration so the theme's
+    # finalize_theme step sees the plugin CSS and links it in the head
+    # partial alongside the theme's own stylesheets.
+    if args.plugins_dir is not None:
+        target = get_target(args.target)
+        only = [s.strip() for s in args.plugins.split(",") if s.strip()] or None
+        plugin_stats = import_plugins(args.plugins_dir, args.out, target, only=only)
+        if plugin_stats["imported"]:
+            names = ", ".join(p["slug"] for p in plugin_stats["plugins"])
+            print(f"plugins: imported {plugin_stats['imported']} ({names})")
+        if plugin_stats["unknown"]:
+            print(
+                f"plugins: skipped {len(plugin_stats['unknown'])} "
+                f"without adapter ({', '.join(plugin_stats['unknown'])})"
+            )
 
     if args.themes_dir is not None and args.migrate_theme:
         theme_stats = theme_mod.migrate_active_theme(

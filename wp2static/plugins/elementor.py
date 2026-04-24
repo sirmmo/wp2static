@@ -1,8 +1,9 @@
-"""Render Elementor page-builder data (``_elementor_data``) to HTML.
+"""Adapter for the Elementor page-builder plugin.
 
-Elementor stores each page/post as a JSON tree of sections → columns →
-widgets. We walk the tree and emit plain HTML with ``elementor-*`` class
-names — enough for a static target to display, style, or further rewrite.
+Elementor stores each page/post as a JSON tree in the ``_elementor_data``
+post meta (not in ``post_content``). We walk the tree and emit plain HTML
+with ``elementor-*`` class names — enough for a static target to display,
+style, or further rewrite.
 
 Coverage is intentionally narrow: the widgets actually seen in the source
 dump get first-class renderers; anything else falls through to an HTML
@@ -14,9 +15,13 @@ from __future__ import annotations
 import html
 import json
 import logging
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
-from .wpdata import wp_unslash
+from ..wpdata import wp_unslash
+from .base import PluginAdapter
+
+if TYPE_CHECKING:
+    from ..wpdata import Post
 
 log = logging.getLogger(__name__)
 
@@ -46,7 +51,6 @@ def _render_heading(settings: dict) -> str:
 
 
 def _render_text_editor(settings: dict) -> str:
-    # editor field is pre-rendered HTML (TinyMCE output). We pass it through.
     body = settings.get("editor", "") or ""
     return f'<div class="elementor-text-editor">{body}</div>'
 
@@ -203,15 +207,7 @@ def _render_section(node: dict) -> str:
     return f'<section class="{cls}">{inner}</section>'
 
 
-# --- public API -------------------------------------------------------------
-
-def has_builder_content(post) -> bool:
-    """True if ``post`` was authored with the Elementor builder."""
-    return post.elementor_mode == "builder" and bool(post.elementor_data)
-
-
-def render(post) -> str:
-    """Return rendered HTML for a post's Elementor data, or ``""`` if none."""
+def _render_tree(post: "Post") -> str:
     raw = post.elementor_data
     if not raw:
         return ""
@@ -229,3 +225,18 @@ def render(post) -> str:
         + "\n".join(p for p in parts if p)
         + "\n</div>"
     )
+
+
+# --- adapter ----------------------------------------------------------------
+
+class ElementorAdapter(PluginAdapter):
+    slug = "elementor"
+    # Elementor's own ``[elementor-template]`` is the only shortcode the
+    # frontend exposes; inner widgets are rendered from stored JSON.
+    shortcodes = ("elementor-template",)
+
+    def replaces_post_content(self, post: "Post") -> bool:
+        return post.elementor_mode == "builder" and bool(post.elementor_data)
+
+    def render_post_content(self, post: "Post") -> str:
+        return _render_tree(post)

@@ -1,4 +1,10 @@
-"""Write posts/pages/uploads into a Jekyll or Hugo site tree."""
+"""Write posts/pages/uploads into a Jekyll or Hugo site tree.
+
+This module is intentionally thin: every target-specific decision lives in
+a :class:`~wp2static.targets.base.Target`, which this orchestrator looks
+up and delegates to. Adding a new SSG changes no code here — only a new
+file under :mod:`wp2static.targets`.
+"""
 
 from __future__ import annotations
 
@@ -7,10 +13,9 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
-import yaml
-
-from . import elementor
 from .convert import clean_content, extract_upload_paths
+from .plugins import adapter_for_post
+from .targets import Target, get_target
 from .wpdata import Post, Site
 
 log = logging.getLogger(__name__)
@@ -22,42 +27,10 @@ _TEMPLATE_ROOT = Path(__file__).parent / "templates"
 class EmitOptions:
     out_dir: Path
     uploads_src: Path | None = None   # local path to wp-content/uploads
-    target: str = "jekyll"            # 'jekyll' | 'hugo'
+    target: str = "jekyll"            # target name or Target instance
     markdown: bool = False            # convert body HTML → Markdown
     base_url: str = ""                # site URL (from wp_options.siteurl)
-    install_templates: bool = True    # copy starter gallery templates into out_dir
-
-
-def _dump_yaml(data: dict) -> str:
-    return yaml.safe_dump(
-        data, default_flow_style=False, allow_unicode=True, sort_keys=False,
-    )
-
-
-def _dump_toml(data: dict) -> str:
-    """Tiny TOML emitter — enough for flat front matter with string/list/int."""
-    out = []
-    for k, v in data.items():
-        out.append(f"{k} = {_toml_value(v)}")
-    return "\n".join(out) + "\n"
-
-
-def _toml_value(v) -> str:
-    if isinstance(v, bool):
-        return "true" if v else "false"
-    if isinstance(v, (int, float)):
-        return str(v)
-    if isinstance(v, list):
-        return "[" + ", ".join(_toml_value(x) for x in v) + "]"
-    # strings
-    s = str(v).replace("\\", "\\\\").replace('"', '\\"')
-    return f'"{s}"'
-
-
-def _frontmatter(data: dict, target: str) -> str:
-    if target == "hugo":
-        return "+++\n" + _dump_toml(data) + "+++\n\n"
-    return "---\n" + _dump_yaml(data) + "---\n\n"
+    install_templates: bool = True    # copy starter gallery templates
 
 
 def _post_frontmatter(post: Post, ext: str) -> dict:
@@ -90,24 +63,6 @@ def _write_file(path: Path, body: str) -> None:
     path.write_text(body, encoding="utf-8")
 
 
-def _post_output_path(opts: EmitOptions, post: Post, ext: str) -> Path:
-    slug = post.slug or f"post-{post.post_id}"
-    if opts.target == "hugo":
-        subdir = "posts" if post.post_type == "post" else ""
-        return opts.out_dir / "content" / subdir / f"{slug}{ext}"
-    # jekyll
-    if post.post_type == "post":
-        datestr = post.date.strftime("%Y-%m-%d")
-        return opts.out_dir / "_posts" / f"{datestr}-{slug}{ext}"
-    return opts.out_dir / f"{slug}{ext}"
-
-
-def _uploads_dest(opts: EmitOptions) -> Path:
-    if opts.target == "hugo":
-        return opts.out_dir / "static" / "uploads"
-    return opts.out_dir / "assets" / "uploads"
-
-
 def _front_page(site: Site) -> Post | None:
     """Return the page configured as the static front page, if any."""
     if site.show_on_front != "page" or not site.page_on_front:
@@ -118,90 +73,9 @@ def _front_page(site: Site) -> Post | None:
     return None
 
 
-def _write_site_config(opts: EmitOptions, site: Site) -> int:
-    """Write the SSG root config file (``hugo.toml`` / ``_config.yml``).
-
-    Populated from the WordPress options so the generated tree works out of
-    the box. Never overwritten if the user has already customised it.
-    """
-    base_url = opts.base_url or site.base_url or ""
-    title = site.site_name or "Site"
-    theme = site.active_theme or ""
-    description = site.site_description or ""
-    if opts.target == "hugo":
-        cfg = opts.out_dir / "hugo.toml"
-        if cfg.exists():
-            return 0
-        lines = [
-            f'baseURL = "{base_url}/"' if base_url else 'baseURL = "/"',
-            f'title = "{_toml_escape(title)}"',
-            'languageCode = "en-us"',
-        ]
-        if theme:
-            lines.append(f'theme = "{_toml_escape(theme)}"')
-        if description:
-            lines.append("[params]")
-            lines.append(f'  description = "{_toml_escape(description)}"')
-        cfg.parent.mkdir(parents=True, exist_ok=True)
-        cfg.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        return 1
-    # jekyll
-    cfg = opts.out_dir / "_config.yml"
-    if cfg.exists():
-        return 0
-    data = {
-        "title": title,
-        "description": description,
-        "url": base_url,
-    }
-    cfg.parent.mkdir(parents=True, exist_ok=True)
-    cfg.write_text(_dump_yaml(data), encoding="utf-8")
-    return 1
-
-
-def _toml_escape(s: str) -> str:
-    return (s or "").replace("\\", "\\\\").replace('"', '\\"')
-
-
-def _write_index(
-    opts: EmitOptions, site: Site, front_page: Post | None, front_body: str,
-) -> int:
-    """Write the site's homepage file. Returns 1 if written, else 0."""
-    title = front_page.title if front_page else (site.site_name or "Home")
-    if opts.target == "hugo":
-        fm: dict = {"title": title}
-        if front_page and front_page.date:
-            fm["date"] = front_page.date.isoformat(sep=" ")
-        if site.site_description and not front_page:
-            fm["description"] = site.site_description
-        body = front_body if front_page else ""
-        # Match the file extension to the body format so Hugo's markdown
-        # renderer doesn't accidentally process HTML content.
-        index_ext = ".md" if opts.markdown else ".html"
-        _write_file(
-            opts.out_dir / "content" / f"_index{index_ext}",
-            _frontmatter(fm, "hugo") + body + "\n",
-        )
-        # Section index for posts — lets Hugo render /posts/ via list.html.
-        _write_file(
-            opts.out_dir / "content" / "posts" / f"_index{index_ext}",
-            _frontmatter({"title": "Posts"}, "hugo") + "\n",
-        )
-        return 1
-    # jekyll
-    fm = {"layout": "home", "title": title}
-    if site.site_description and not front_page:
-        fm["description"] = site.site_description
-    body = front_body if front_page else ""
-    _write_file(
-        opts.out_dir / "index.html",
-        _frontmatter(fm, "jekyll") + body + "\n",
-    )
-    return 1
-
-
 def emit(site: Site, opts: EmitOptions) -> dict:
     """Write the full site tree. Returns a small stats dict."""
+    target: Target = get_target(opts.target)
     ext = _file_ext(opts.markdown)
     base_url = opts.base_url or site.base_url
 
@@ -214,14 +88,15 @@ def emit(site: Site, opts: EmitOptions) -> dict:
 
     for post in site.posts + site.pages:
         source_html = post.content_html
-        if elementor.has_builder_content(post):
-            rendered = elementor.render(post)
+        # Some plugins (Elementor, etc.) store rendered output in post
+        # meta rather than ``post_content`` — let the registry decide.
+        content_adapter = adapter_for_post(post)
+        if content_adapter is not None:
+            rendered = content_adapter.render_post_content(post)
             if rendered:
-                # Elementor replaces the classic content when builder mode
-                # is on; the post_content field is usually empty or a
-                # shortcode stub in that case.
                 source_html = rendered
-                elementor_posts += 1
+                if content_adapter.slug == "elementor":
+                    elementor_posts += 1
         body = clean_content(
             source_html,
             base_url=base_url,
@@ -230,7 +105,7 @@ def emit(site: Site, opts: EmitOptions) -> dict:
             attachments=site.attachments,
             finaltiles_by_id=site.galleries,
             finaltiles_by_slug=site.galleries_by_slug,
-            target=opts.target,
+            target=target,
         )
         fm = _post_frontmatter(post, ext)
         # Scan both the original WP content and the Elementor-rendered HTML so
@@ -242,19 +117,22 @@ def emit(site: Site, opts: EmitOptions) -> dict:
         if front_page is not None and post.post_id == front_page.post_id:
             front_body = body
             continue  # don't also write this page under content/<slug>.html
-        path = _post_output_path(opts, post, ext)
-        _write_file(path, _frontmatter(fm, opts.target) + body + "\n")
+        path = target.post_output_path(opts.out_dir, post, ext)
+        _write_file(path, target.frontmatter(fm) + body + "\n")
         if post.post_type == "post":
             written_posts += 1
         else:
             written_pages += 1
 
-    indexes_written = _write_index(opts, site, front_page, front_body)
-    config_written = _write_site_config(opts, site)
+    indexes_written = target.write_index(
+        opts.out_dir, site, front_page, front_body, opts.markdown,
+    )
+    config_written = target.write_site_config(opts.out_dir, site, base_url)
+    menus_written = target.write_menus(opts.out_dir, site)
 
     templates_copied = 0
     if opts.install_templates:
-        src_root = _TEMPLATE_ROOT / opts.target
+        src_root = _TEMPLATE_ROOT / target.name
         if src_root.is_dir():
             for src in src_root.rglob("*"):
                 if not src.is_file():
@@ -269,7 +147,7 @@ def emit(site: Site, opts: EmitOptions) -> dict:
 
     copied = 0
     if opts.uploads_src:
-        dest_root = _uploads_dest(opts)
+        dest_root = target.uploads_dest(opts.out_dir)
         for rel in sorted(referenced_uploads):
             src = opts.uploads_src / rel
             if not src.is_file():
@@ -289,4 +167,5 @@ def emit(site: Site, opts: EmitOptions) -> dict:
         "templates_copied": templates_copied,
         "indexes_written": indexes_written,
         "config_written": config_written,
+        "menus_written": menus_written,
     }

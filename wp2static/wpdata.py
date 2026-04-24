@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import html
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -96,6 +98,31 @@ class Gallery:
 
 
 @dataclass
+class NavMenuItem:
+    """A single entry in a WordPress ``nav_menu``.
+
+    ``url`` is a resolved, target-agnostic link path (leading-slash, trailing
+    slash for internal routes) that both Jekyll and Hugo can consume
+    directly. ``children`` is populated after all items are loaded.
+    """
+    item_id: int
+    label: str
+    url: str
+    parent_id: int = 0       # WP menu-item parent (0 = top-level)
+    order: int = 0
+    target: str = ""         # HTML target attribute — '_blank' or ''
+    children: list["NavMenuItem"] = field(default_factory=list)
+
+
+@dataclass
+class NavMenu:
+    term_id: int
+    name: str
+    slug: str
+    items: list[NavMenuItem] = field(default_factory=list)  # top-level only
+
+
+@dataclass
 class Site:
     posts: list[Post]
     pages: list[Post]
@@ -109,6 +136,19 @@ class Site:
     show_on_front: str = ""  # 'posts' | 'page' — from wp_options.show_on_front
     page_on_front: int = 0   # post ID used as the static front page
     page_for_posts: int = 0  # post ID used as the blog index
+    menus: list[NavMenu] = field(default_factory=list)
+    # theme-registered menu slot → menu slug (e.g. 'primary' → 'main-menu').
+    menu_locations: dict[str, str] = field(default_factory=dict)
+
+
+def _html_unescape(value: str) -> str:
+    """HTML-entity decode — ``&amp;`` → ``&``.
+
+    WP `wp_options` stores display strings already HTML-encoded (legacy
+    kses/sanitize behaviour); passing them through raw means templates
+    that escape on output render ``&amp;`` as visible text.
+    """
+    return html.unescape(value)
 
 
 def wp_unslash(value: str) -> str:
@@ -131,6 +171,229 @@ def wp_unslash(value: str) -> str:
         out.append(c)
         i += 1
     return "".join(out)
+
+
+# Pull `nav_menu_locations` out of a PHP-serialized ``theme_mods_<theme>``
+# blob without implementing a full ``unserialize()``. The shape we're after
+# is always ``s:19:"nav_menu_locations";a:N:{ s:…:"<slot>";i:<term_id>; … }``
+# and no nested arrays are expected inside that block.
+_THEME_MODS_LOC_RE = re.compile(
+    r's:\d+:"nav_menu_locations";a:\d+:\{([^{}]*)\}',
+)
+_LOC_ENTRY_RE = re.compile(r's:\d+:"([^"]+)";i:(\d+);')
+
+
+def _parse_nav_menu_locations(serialized: str) -> dict[str, int]:
+    m = _THEME_MODS_LOC_RE.search(serialized or "")
+    if not m:
+        return {}
+    return {
+        entry.group(1): int(entry.group(2))
+        for entry in _LOC_ENTRY_RE.finditer(m.group(1))
+    }
+
+
+def _strip_base(url: str, base_url: str) -> str:
+    """If ``url`` points back at the site, strip the base so the link is
+    served correctly after migration. Otherwise return it unchanged.
+
+    WordPress databases often preserve ``http://`` menu URLs even after
+    the site moved to ``https://`` (or vice versa), so we accept the
+    alternate scheme as a match — any link to our own hostname is
+    internal regardless of scheme.
+    """
+    if not url:
+        return ""
+    if not base_url:
+        return url
+    candidates = [base_url]
+    if base_url.startswith("https://"):
+        candidates.append("http://" + base_url[len("https://"):])
+    elif base_url.startswith("http://"):
+        candidates.append("https://" + base_url[len("http://"):])
+    for base in candidates:
+        if url.startswith(base):
+            return url[len(base):] or "/"
+    return url
+
+
+def _resolve_menu_item_url(
+    meta: dict[str, str],
+    posts_by_id: dict[int, "Post"],
+    pages_by_id: dict[int, "Post"],
+    terms: dict[int, "Term"],
+    base_url: str,
+) -> str:
+    """Compute a target-agnostic link path for a single nav_menu_item.
+
+    WordPress records the link type in ``_menu_item_type`` and the linked
+    entity in ``_menu_item_object_id`` / ``_menu_item_object``; for
+    ``custom`` items the literal URL is stored in ``_menu_item_url``. We
+    mirror the URL shapes a vanilla Hugo/Jekyll config produces so that
+    the emitted menu entries land on the pages the migrator actually
+    wrote to disk.
+    """
+    item_type = (meta.get("_menu_item_type") or "").strip()
+    obj = (meta.get("_menu_item_object") or "").strip()
+    raw_id = meta.get("_menu_item_object_id") or "0"
+    try:
+        object_id = int(raw_id)
+    except (TypeError, ValueError):
+        object_id = 0
+    if item_type == "custom":
+        return _strip_base(meta.get("_menu_item_url", "") or "/", base_url)
+    if item_type == "post_type":
+        if obj == "page":
+            page = pages_by_id.get(object_id)
+            if page:
+                return f"/{page.slug}/"
+        else:
+            post = posts_by_id.get(object_id)
+            if post:
+                return f"/posts/{post.slug}/"
+        return "/"
+    if item_type == "taxonomy":
+        term = terms.get(object_id)
+        slug = term.slug if term else ""
+        if not slug:
+            return "/"
+        if obj == "category":
+            return f"/categories/{slug}/"
+        if obj == "post_tag":
+            return f"/tags/{slug}/"
+        return f"/{obj}/{slug}/"
+    if item_type == "post_type_archive":
+        return f"/{obj or 'posts'}/"
+    return "/"
+
+
+def _menu_item_label(
+    title: str,
+    meta: dict[str, str],
+    posts_by_id: dict[int, "Post"],
+    pages_by_id: dict[int, "Post"],
+    terms: dict[int, "Term"],
+) -> str:
+    """Prefer the author-set label (``post_title``), otherwise fall back
+    to the linked entity's name so items appear even when the editor
+    never typed a custom label in the Menus screen.
+    """
+    if title:
+        return title
+    item_type = (meta.get("_menu_item_type") or "").strip()
+    try:
+        object_id = int(meta.get("_menu_item_object_id") or "0")
+    except (TypeError, ValueError):
+        object_id = 0
+    if item_type == "post_type":
+        obj = (meta.get("_menu_item_object") or "").strip()
+        source = pages_by_id if obj == "page" else posts_by_id
+        linked = source.get(object_id)
+        if linked:
+            return linked.title
+    if item_type == "taxonomy":
+        term = terms.get(object_id)
+        if term:
+            return term.name
+    return ""
+
+
+def _build_menus(
+    *,
+    raw_posts: dict[int, dict],
+    postmeta: dict[int, dict[str, str]],
+    terms: dict[int, "Term"],
+    taxonomies: dict[int, "Taxonomy"],
+    object_terms: dict[int, list[int]],
+    posts_by_id: dict[int, "Post"],
+    pages_by_id: dict[int, "Post"],
+    theme_mods_raw: dict[str, str],
+    active_theme: str,
+    base_url: str,
+) -> tuple[list[NavMenu], dict[str, str]]:
+    # term_taxonomy_id -> nav_menu term_id
+    nav_ttid_to_term: dict[int, int] = {
+        tax.term_taxonomy_id: tax.term_id
+        for tax in taxonomies.values()
+        if tax.taxonomy == "nav_menu"
+    }
+    menus_by_term_id: dict[int, NavMenu] = {}
+    for term_id in {tid for tid in nav_ttid_to_term.values()}:
+        term = terms.get(term_id)
+        if not term:
+            continue
+        menus_by_term_id[term_id] = NavMenu(
+            term_id=term_id, name=term.name, slug=term.slug,
+        )
+
+    # Collect every nav_menu_item, grouped by its parent menu term.
+    items_by_menu: dict[int, list[NavMenuItem]] = {}
+    for pid, d in raw_posts.items():
+        if d.get("post_type") != "nav_menu_item":
+            continue
+        if d.get("post_status") != "publish":
+            continue
+        meta = postmeta.get(pid, {})
+        # A nav_menu_item belongs to exactly one nav_menu term — find it.
+        menu_term_id: int | None = None
+        for ttid in object_terms.get(pid, ()):
+            if ttid in nav_ttid_to_term:
+                menu_term_id = nav_ttid_to_term[ttid]
+                break
+        if menu_term_id is None or menu_term_id not in menus_by_term_id:
+            continue
+        label = _menu_item_label(
+            d.get("post_title", "") or "", meta,
+            posts_by_id, pages_by_id, terms,
+        )
+        if not label:
+            continue  # nothing useful to render
+        url = _resolve_menu_item_url(
+            meta, posts_by_id, pages_by_id, terms, base_url,
+        )
+        try:
+            parent_id = int(meta.get("_menu_item_menu_item_parent", "0") or 0)
+        except (TypeError, ValueError):
+            parent_id = 0
+        try:
+            order = int(d.get("menu_order", 0) or 0)
+        except (TypeError, ValueError):
+            order = 0
+        items_by_menu.setdefault(menu_term_id, []).append(NavMenuItem(
+            item_id=pid, label=label, url=url,
+            parent_id=parent_id, order=order,
+            target=(meta.get("_menu_item_target") or "").strip(),
+        ))
+
+    # Turn the flat list into a parent/child tree, ordered by menu_order.
+    for term_id, menu in menus_by_term_id.items():
+        flat = sorted(items_by_menu.get(term_id, ()), key=lambda it: it.order)
+        by_id = {it.item_id: it for it in flat}
+        top: list[NavMenuItem] = []
+        for it in flat:
+            parent = by_id.get(it.parent_id)
+            if parent is not None and parent is not it:
+                parent.children.append(it)
+            else:
+                top.append(it)
+        menu.items = top
+
+    menus = [m for m in menus_by_term_id.values() if m.items]
+
+    # Resolve theme-registered slots ('primary', 'footer', ...) to menu
+    # slugs so emitters can place each menu in the right location.
+    menu_locations: dict[str, str] = {}
+    slug_of_term: dict[int, str] = {m.term_id: m.slug for m in menus}
+    mods_key = f"theme_mods_{active_theme}" if active_theme else ""
+    if mods_key and mods_key in theme_mods_raw:
+        for slot, term_id in _parse_nav_menu_locations(
+            theme_mods_raw[mods_key],
+        ).items():
+            slug = slug_of_term.get(term_id)
+            if slug:
+                menu_locations[slot] = slug
+
+    return menus, menu_locations
 
 
 def _parse_dt(value) -> datetime:
@@ -171,6 +434,7 @@ def load(dump_path: Path, table_prefix: str = "wp_") -> Site:
     page_for_posts = 0
     ft_galleries: dict[int, dict] = {}       # Id -> {"slug", "name"}
     ft_images: dict[int, list[dict]] = {}    # gid -> [{"sort", "imageId", "url"}]
+    theme_mods_raw: dict[str, str] = {}      # 'theme_mods_<slug>' -> serialized PHP
 
     for table, row in iter_rows(dump_path, tables=wanted):
         suffix = table[len(table_prefix):]
@@ -203,9 +467,13 @@ def load(dump_path: Path, table_prefix: str = "wp_") -> Site:
             elif name == "template" and not active_theme:
                 active_theme = str(value)
             elif name == "blogname":
-                site_name = str(value)
+                # WP stores option values HTML-encoded (``Burro &amp; Ansia``).
+                # Decode here so Hugo/Jekyll can apply their own escaping
+                # once when rendering — otherwise templates show the raw
+                # ``&amp;`` entity to visitors.
+                site_name = _html_unescape(str(value))
             elif name == "blogdescription":
-                site_description = str(value)
+                site_description = _html_unescape(str(value))
             elif name == "show_on_front":
                 show_on_front = str(value)
             elif name == "page_on_front":
@@ -218,6 +486,8 @@ def load(dump_path: Path, table_prefix: str = "wp_") -> Site:
                     page_for_posts = int(value)
                 except (TypeError, ValueError):
                     page_for_posts = 0
+            elif isinstance(name, str) and name.startswith("theme_mods_"):
+                theme_mods_raw[name] = str(value)
         elif suffix == "FinalTiles_gallery":
             d = _row_to_dict(row, FT_GALLERY_COLS)
             try:
@@ -318,6 +588,21 @@ def load(dump_path: Path, table_prefix: str = "wp_") -> Site:
 
     log.info("loaded %d FinalTiles galleries", len(galleries))
 
+    posts_by_id = {p.post_id: p for p in posts}
+    pages_by_id = {p.post_id: p for p in pages}
+    menus, menu_locations = _build_menus(
+        raw_posts=raw_posts,
+        postmeta=postmeta,
+        terms=terms,
+        taxonomies=taxonomies,
+        object_terms=object_terms,
+        posts_by_id=posts_by_id,
+        pages_by_id=pages_by_id,
+        theme_mods_raw=theme_mods_raw,
+        active_theme=active_theme,
+        base_url=base_url,
+    )
+
     return Site(
         posts=posts, pages=pages, attachments=attachments,
         galleries=galleries, galleries_by_slug=galleries_by_slug,
@@ -328,4 +613,6 @@ def load(dump_path: Path, table_prefix: str = "wp_") -> Site:
         show_on_front=show_on_front,
         page_on_front=page_on_front,
         page_for_posts=page_for_posts,
+        menus=menus,
+        menu_locations=menu_locations,
     )

@@ -4,7 +4,14 @@ from __future__ import annotations
 
 import logging
 import re
+from typing import TYPE_CHECKING
 from urllib.parse import urlparse
+
+from .plugins import RenderContext, adapter_for_shortcode
+from .targets import get_target
+
+if TYPE_CHECKING:
+    from .targets import Target
 
 log = logging.getLogger(__name__)
 
@@ -23,42 +30,16 @@ def _parse_attrs(attr_src: str) -> dict[str, str]:
 
 # --- gallery shortcodes -----------------------------------------------------
 
+# WordPress core ``[gallery ids="…"]`` — resolved here against the
+# attachments table. Plugin-owned shortcodes are dispatched to the
+# plugin registry below.
 _GALLERY_RE = re.compile(
     r"\[gallery(?P<attrs>[^\]]*)\]", re.IGNORECASE,
 )
-_FINALTILES_RE = re.compile(
-    r"\[FinalTilesGallery(?P<attrs>[^\]]*)\]", re.IGNORECASE,
+# Any plugin shortcode — dispatched through :func:`plugins.adapter_for_shortcode`.
+_PLUGIN_SHORTCODE_RE = re.compile(
+    r"\[(?P<name>[a-zA-Z][a-zA-Z0-9_-]*)(?P<attrs>[^\]]*)\]",
 )
-
-
-def _emit_gallery_directive(target: str, images: list[str], title: str = "") -> str:
-    """Return a target-specific directive referring to ``images`` (URL paths).
-
-    The generated directive is on its own line, surrounded by blank lines, so
-    ``wpautop`` leaves it unwrapped (see :func:`wpautop` for the detection rule).
-    """
-    images = [i for i in images if i]
-    if not images:
-        return ""
-    joined = ",".join(images)
-    if target == "hugo":
-        if title:
-            body = f'{{{{< gallery images="{joined}" title="{_esc(title)}" >}}}}'
-        else:
-            body = f'{{{{< gallery images="{joined}" >}}}}'
-    else:  # jekyll
-        if title:
-            body = (
-                f'{{% include gallery.html images="{joined}" '
-                f'title="{_esc(title)}" %}}'
-            )
-        else:
-            body = f'{{% include gallery.html images="{joined}" %}}'
-    return f"\n\n{body}\n\n"
-
-
-def _esc(s: str) -> str:
-    return s.replace('"', "&quot;")
 
 
 def _attachment_url(attachment, uploads_prefix: str) -> str:
@@ -68,11 +49,6 @@ def _attachment_url(attachment, uploads_prefix: str) -> str:
     return attachment.url
 
 
-def _strip_thumbnail_suffix(url: str) -> str:
-    """Turn `foo-150x150.jpg` into `foo.jpg` (WP thumbnail naming)."""
-    return re.sub(r"-\d+x\d+(\.[a-zA-Z0-9]+)$", r"\1", url)
-
-
 def resolve_galleries(
     html: str,
     attachments: dict[int, object],
@@ -80,13 +56,26 @@ def resolve_galleries(
     finaltiles_by_slug: dict[str, object],
     base_url: str,
     uploads_prefix: str,
-    target: str,
+    target: "str | Target",
 ) -> str:
-    """Replace gallery shortcodes with target-specific directives."""
+    """Replace gallery shortcodes with target-specific directives.
+
+    WP core ``[gallery]`` is handled inline; every other shortcode is
+    dispatched to a :class:`~wp2static.plugins.PluginAdapter` that
+    claims it via :meth:`owns_shortcode`.
+    """
     if not html:
         return html
 
-    host = urlparse(base_url).netloc if base_url else ""
+    tgt = get_target(target)
+    ctx = RenderContext(
+        attachments=attachments,
+        galleries_by_id=finaltiles_by_id,
+        galleries_by_slug=finaltiles_by_slug,
+        base_url=base_url,
+        uploads_prefix=uploads_prefix,
+        target=tgt,
+    )
 
     def _image_url_for_id(att_id: int) -> str | None:
         att = attachments.get(att_id)
@@ -94,51 +83,23 @@ def resolve_galleries(
             return None
         return _attachment_url(att, uploads_prefix)
 
-    def _local_from_url(url: str) -> str:
-        """If ``url`` points at this site's uploads, rewrite to local path."""
-        if not host:
-            return url
-        pat = re.compile(
-            rf"(?:https?:)?//{re.escape(host)}/wp-content/uploads/",
-            re.IGNORECASE,
-        )
-        if pat.search(url):
-            return pat.sub(uploads_prefix.rstrip("/") + "/", url)
-        return url
-
     def _handle_gallery(m: re.Match) -> str:
         attrs = _parse_attrs(m.group("attrs") or "")
         ids_raw = attrs.get("ids") or attrs.get("include") or ""
         ids = [int(x) for x in re.findall(r"\d+", ids_raw)]
         urls = [u for u in (_image_url_for_id(i) for i in ids) if u]
-        return _emit_gallery_directive(target, urls)
+        return tgt.gallery_directive(urls)
 
-    def _handle_finaltiles(m: re.Match) -> str:
+    def _handle_plugin_shortcode(m: re.Match) -> str:
+        name = m.group("name")
+        adapter = adapter_for_shortcode(name)
+        if adapter is None:
+            return m.group(0)  # not a plugin we own — leave for strip_shortcodes
         attrs = _parse_attrs(m.group("attrs") or "")
-        gid_raw = attrs.get("id") or ""
-        slug = attrs.get("slug") or ""
-        gallery = None
-        if gid_raw.isdigit():
-            gallery = finaltiles_by_id.get(int(gid_raw))
-        if gallery is None and slug:
-            gallery = finaltiles_by_slug.get(slug)
-        if gallery is None:
-            log.warning("FinalTilesGallery %r/%r not found in dump", gid_raw, slug)
-            return ""
-        # Prefer attachment-resolved URLs (full-size), fall back to the plugin's
-        # stored imagePath (which is typically the thumbnail URL).
-        urls: list[str] = []
-        for att_id in gallery.image_ids:
-            url = _image_url_for_id(att_id)
-            if url:
-                urls.append(url)
-        if not urls:
-            urls = [_strip_thumbnail_suffix(_local_from_url(u))
-                    for u in gallery.image_urls]
-        return _emit_gallery_directive(target, urls, title=gallery.name)
+        return adapter.render_shortcode(name, attrs, ctx)
 
     html = _GALLERY_RE.sub(_handle_gallery, html)
-    html = _FINALTILES_RE.sub(_handle_finaltiles, html)
+    html = _PLUGIN_SHORTCODE_RE.sub(_handle_plugin_shortcode, html)
     return html
 
 
@@ -296,7 +257,7 @@ def clean_content(
     attachments: dict[int, object] | None = None,
     finaltiles_by_id: dict[int, object] | None = None,
     finaltiles_by_slug: dict[str, object] | None = None,
-    target: str = "jekyll",
+    target: "str | Target" = "jekyll",
 ) -> str:
     """Full post-content pipeline.
 
